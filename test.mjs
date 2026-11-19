@@ -254,6 +254,22 @@ try {
   assert.equal(await D.p.sync("empty", () => {}), "1 change sent");
   assert.equal(sh(`git -C ${path.join(srv, "IsometriaInternal", "empty.git")} show main:first.md`), "first");
   console.log("ok: empty repo");
+
+  // pulled while empty, then the repo was filled elsewhere (a copy pushed to it): Sync brings it in
+  const late = path.join(srv, "IsometriaInternal", "late.git");
+  sh(`git init -q --bare -b main ${late} && git -C ${late} config http.receivepack true`);
+  const H = device("hana");
+  assert.equal(await H.p.sync("late", () => {}), "pulled");
+  fs.writeFileSync(path.join(H.root, "late", "mine.md"), "hana\n");   // a note made meanwhile
+  sh(`rm -rf s3 && git init -q -b main s3 && cd s3 && git config user.email s@x && git config user.name seed && ` +
+     `mkdir -p notes && echo brain > notes/a.md && git add -A && git commit -qm c1 && git push -q ${late} main`);
+  assert.match(await H.p.sync("late", () => {}), /^linked/);
+  assert.equal(fs.readFileSync(path.join(H.root, "late", "notes/a.md"), "utf8"), "brain\n");
+  assert.equal(fs.readFileSync(path.join(H.root, "late", "mine.md"), "utf8"), "hana\n", "her note kept");
+  assert.equal(await H.p.sync("late", () => {}), "1 change sent");
+  assert.equal(sh(`git -C ${late} show main:mine.md`), "hana");
+  assert.equal(sh(`git -C ${late} show main:notes/a.md`), "brain");
+  console.log("ok: empty repo filled later");
 } finally {
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });

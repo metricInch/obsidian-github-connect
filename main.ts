@@ -239,6 +239,17 @@ export default class GitHubConnect extends Plugin {
       }
 
       const author = this.author, branch = (await git.currentBranch({ fs, dir })) ?? "main";
+
+      // Pulled while the repo was empty, and GitHub has commits now: link to them like an existing
+      // folder (notes made here meanwhile are kept and sent on the next Sync).
+      if (!(await git.resolveRef({ fs, dir, ref: "HEAD" }).catch(() => null))) {
+        say("Checking GitHub");
+        await git.fetch({ ...g, dir, singleBranch: true, ref: branch, tags: false });
+        if (await git.resolveRef({ fs, dir, ref: `refs/remotes/origin/${branch}` }).catch(() => null)) {
+          await a.rmdir(`${repo}/.git`, true);
+          return this.done(repo, await this.adopt(repo, onProgress));
+        }
+      }
       const merging = this.s.merging[repo];
       if (merging) {
         for (const f of merging.files)
