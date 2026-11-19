@@ -1,7 +1,7 @@
 import { Buffer } from "buffer";
 import git, { GitHttpRequest, GitHttpResponse } from "isomorphic-git";
 import {
-  App, DataAdapter, Modal, Notice, Plugin, PluginSettingTab, Setting, Stat,
+  App, DataAdapter, ItemView, Notice, Plugin, PluginSettingTab, Setting, Stat, WorkspaceLeaf,
   RequestUrlResponse, normalizePath, requestUrl,
 } from "obsidian";
 
@@ -20,12 +20,19 @@ const CLIENT_ID = "Iv23liN72h2n3K7zuhDS"; // public by design: device flow has n
 const OWNER = "IsometriaInternal";
 const SECRET = "github-connect-token";
 const REFRESH = "github-connect-refresh";
+const VIEW = "github-vaults";
 const FORM = { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" };
 
 export default class GitHubConnect extends Plugin {
   s: Settings = { ...DEFAULTS };
   base = "https://github.com"; // git host; tests point it at a local server
   busy = new Set<string>();
+  // Background jobs: run in the plugin, not in any view, so closing the panel doesn't stop them.
+  jobs = new Map<string, { step: string; frac?: number; t0: number }>();
+  errors: Record<string, string> = {};
+  names?: string[]; // cached vault list
+  listeners = new Set<(structural: boolean) => void>();
+  statusEl?: HTMLElement;
 
   // Token lives in Obsidian's secret storage, not in the vault's data.json.
   get token() { return this.app.secretStorage.getSecret(SECRET) ?? ""; }
@@ -43,6 +50,7 @@ export default class GitHubConnect extends Plugin {
 
   async signOut() {
     this.token = this.refresh = this.s.login = "";
+    this.names = undefined;
     this.s.expires = this.s.id = 0;
     await this.save();
   }
@@ -71,18 +79,45 @@ export default class GitHubConnect extends Plugin {
     this.s = { ...DEFAULTS, synced: {}, merging: {}, ...d };
     await this.save();
     this.addSettingTab(new Tab(this.app, this));
-    this.addRibbonIcon("github", "GitHub vaults", () => new VaultsModal(this).open());
+    this.registerView(VIEW, (leaf) => new VaultsView(leaf, this));
+    this.addRibbonIcon("github", "GitHub vaults", () => this.openView());
+    this.statusEl = this.addStatusBarItem(); // desktop only; mobile has no status bar
     this.addCommand({ id: "sign-in", name: "Sign in", callback: () => this.signIn().catch((e) => new Notice(`GitHub: ${e.message}`)) });
-    this.addCommand({ id: "vaults", name: "Open vaults", callback: () => new VaultsModal(this).open() });
+    this.addCommand({ id: "vaults", name: "Open vaults", callback: () => this.openView() });
     this.addCommand({ id: "sync-current", name: "Sync the vault of the current note", checkCallback: (checking) => {
       const repo = this.app.workspace.getActiveFile()?.path.split("/")[0];
       if (!repo || !this.s.synced[repo]) return false;
-      if (!checking) this.sync(repo, () => {}).then((m) => new Notice(`${repo}: ${m}`), (e) => new Notice(`${repo}: ${e.message}`, 15000));
+      if (!checking) this.run(repo);
       return true;
     } });
   }
 
   save() { return this.saveData(this.s); }
+
+  async openView() {
+    const ws = this.app.workspace;
+    let leaf = ws.getLeavesOfType(VIEW)[0];
+    if (!leaf) { leaf = ws.getRightLeaf(false)!; await leaf.setViewState({ type: VIEW, active: true }); }
+    ws.revealLeaf(leaf);
+  }
+
+  // Start Pull / Link / Sync in the background; progress goes to listeners and the status bar.
+  run(repo: string) {
+    if (this.jobs.has(repo)) return;
+    delete this.errors[repo];
+    this.jobs.set(repo, { step: "Starting", t0: Date.now() });
+    this.changed(true);
+    this.sync(repo, (step, frac) => { this.jobs.set(repo, { ...this.jobs.get(repo)!, step, frac }); this.changed(false); })
+      .then((m) => { new Notice(`${repo}: ${m}`); },
+        (e) => { this.errors[repo] = e.message; new Notice(`${repo}: ${e.message}`, 15000); })
+      .finally(() => { this.jobs.delete(repo); this.changed(true); });
+  }
+
+  changed(structural: boolean) {
+    const [repo, j] = [...this.jobs][0] ?? [];
+    this.statusEl?.setText(j ? `GitHub: ${repo} ${jobText(j)}${this.jobs.size > 1 ? ` (+${this.jobs.size - 1})` : ""}` : "");
+    this.listeners.forEach((f) => f(structural));
+  }
 
   // OAuth device flow: only the public client ID is needed, no secret ships in the plugin.
   async signIn() {
@@ -366,65 +401,80 @@ const ago = (t: number) => {
   return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
 };
 
-// One row per vault the user can access, each with its own Pull / Sync button.
-class VaultsModal extends Modal {
-  constructor(private p: GitHubConnect) { super(p.app); }
+const jobText = (j: { step: string; frac?: number; t0: number }) =>
+  j.frac === undefined ? `${j.step} · ${Math.round((Date.now() - j.t0) / 1000)} s` : `${j.step} ${Math.round(j.frac * 100)}%`;
 
-  onOpen() { this.render(); }
+// Right-sidebar panel: one row per vault the user can access, each with its own Pull / Link / Sync button.
+class VaultsView extends ItemView {
+  rows = new Map<string, { label: HTMLElement; bar: HTMLProgressElement }>();
+  gen = 0;
+  constructor(leaf: WorkspaceLeaf, private p: GitHubConnect) { super(leaf); }
+  getViewType() { return VIEW; }
+  getDisplayText() { return "GitHub vaults"; }
+  getIcon() { return "github"; }
+
+  onChange = (structural: boolean) => (structural ? this.render() : this.tick());
+
+  async onOpen() {
+    this.addAction("refresh-cw", "Reload vault list", () => { this.p.names = undefined; this.render(); });
+    this.p.listeners.add(this.onChange);
+    this.registerInterval(window.setInterval(() => this.tick(), 1000)); // elapsed seconds while downloading
+    this.render();
+  }
+
+  async onClose() { this.p.listeners.delete(this.onChange); }
+
+  tick() {
+    for (const [repo, r] of this.rows) {
+      const j = this.p.jobs.get(repo);
+      if (!j) continue;
+      r.label.setText(jobText(j));
+      if (j.frac === undefined) r.bar.removeAttribute("value"); else r.bar.value = j.frac;
+    }
+  }
 
   async render() {
-    const { contentEl: el, p } = this;
-    this.titleEl.setText(`${OWNER} vaults`);
-    el.empty();
+    const id = ++this.gen, p = this.p, el = this.contentEl, a = p.app.vault.adapter;
     if (!p.token) {
+      el.empty();
       new Setting(el).setName("Not signed in").addButton((b) => b.setButtonText("Sign in").setCta()
         .onClick(async () => { await p.signIn(); this.render(); }));
       return;
     }
-    const loading = el.createEl("p", { text: "Loading…" });
-    const names = await p.vaults().catch((e) => { loading.setText(`Could not load vaults: ${e.message}`); return null; });
-    if (!names) return;
-    loading.remove();
-    if (!names.length) el.createEl("p", { text: "No vaults yet. Ask an org owner to add the app to a repo." });
-    for (const name of names) {
-      const here = await p.app.vault.adapter.exists(`${name}/.git`), folder = here || (await p.app.vault.adapter.exists(name));
-      const row = new Setting(el).setName(name);
-      const m = p.s.merging[name];
-      row.setDesc(m ? `Conflicts to fix: ${m.files.join(", ")}`
-        : here ? `In folder ${name}/ · synced ${p.s.synced[name] ? ago(p.s.synced[name]) : "never"}`
-        : folder ? `Folder ${name}/ is here but not linked to git yet. Your notes are kept.` : "Not on this device");
+    if (!p.names) {
+      el.empty();
+      el.createEl("p", { text: "Loading vaults…" });
+      try { p.names = await p.vaults(); }
+      catch (e: any) { if (id === this.gen) { el.empty(); el.createEl("p", { text: `Could not load vaults: ${e.message}` }); } return; }
+    }
+    // Gather state first, then draw in one go, so overlapping renders can't duplicate rows.
+    const info = await Promise.all(p.names.map(async (name) => {
+      const here = await a.exists(`${name}/.git`);
+      return { name, here, folder: here || (await a.exists(name)) };
+    }));
+    if (id !== this.gen) return;
+    el.empty();
+    this.rows.clear();
+    if (!info.length) el.createEl("p", { text: "No vaults yet. Ask an org owner to add the app to a repo." });
+    for (const { name, here, folder } of info) {
+      const row = new Setting(el).setName(name), job = p.jobs.get(name), m = p.s.merging[name];
+      if (job) {
+        const label = row.descEl.createDiv(), bar = row.descEl.createEl("progress", { attr: { max: "1" } });
+        bar.style.width = "100%";
+        this.rows.set(name, { label, bar });
+      } else {
+        row.setDesc(p.errors[name] ? `Failed: ${p.errors[name]}`
+          : m ? `Conflicts to fix: ${m.files.join(", ")}`
+          : here ? `In folder ${name}/ · synced ${p.s.synced[name] ? ago(p.s.synced[name]) : "never"}`
+          : folder ? `Folder ${name}/ is here but not linked to git yet. Your notes are kept.` : "Not on this device");
+      }
       row.addButton((b) => {
-        b.setButtonText(here ? "Sync" : folder ? "Link" : "Pull").onClick(async () => {
-          b.setDisabled(true);
-          // Native <progress>: a value shows the percentage, no value shows a moving (indeterminate) bar.
-          row.descEl.empty();
-          const label = row.descEl.createDiv(), bar = row.descEl.createEl("progress", { attr: { max: "1" } });
-          bar.style.width = "100%";
-          const t0 = Date.now();
-          let step = "Starting", frac: number | undefined;
-          const show = () => {
-            label.setText(frac === undefined ? `${step} · ${Math.round((Date.now() - t0) / 1000)} s` : `${step} ${Math.round(frac * 100)}%`);
-            if (frac === undefined) bar.removeAttribute("value"); else bar.value = frac;
-          };
-          const tick = window.setInterval(show, 1000);
-          show();
-          try {
-            const msg = await p.sync(name, (t, f) => { step = t; frac = f; show(); });
-            new Notice(`${name}: ${msg}`);
-            this.render();
-          } catch (e: any) {
-            row.setDesc(`Failed: ${e.message}`);
-            b.setDisabled(false);
-          } finally {
-            window.clearInterval(tick);
-          }
-        });
-        if (!here) b.setCta();
+        b.setButtonText(job ? "Working…" : here ? "Sync" : folder ? "Link" : "Pull").setDisabled(!!job).onClick(() => p.run(name));
+        if (!here && !folder && !job) b.setCta();
       });
     }
+    this.tick();
   }
-
-  onClose() { this.contentEl.empty(); }
 }
 
 class Tab extends PluginSettingTab {
@@ -440,8 +490,8 @@ class Tab extends PluginSettingTab {
         this.display();
       }));
     new Setting(el).setName("Vaults")
-      .setDesc(`Pull or sync any ${OWNER} repo you can access. Also on the ribbon (GitHub icon).`)
-      .addButton((b) => b.setButtonText("Open vaults").setCta().onClick(() => new VaultsModal(p).open()));
+      .setDesc(`Pull or sync any ${OWNER} repo you can access, in the right sidebar. Also on the ribbon (GitHub icon).`)
+      .addButton((b) => b.setButtonText("Open vaults").setCta().onClick(() => p.openView()));
     new Setting(el).setName("Repository access")
       .setDesc(`The app only reaches ${OWNER} repos it is installed on. Org owners pick them here.`)
       .addButton((b) => b.setButtonText("Manage").onClick(() =>

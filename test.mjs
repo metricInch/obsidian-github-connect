@@ -10,7 +10,7 @@ import path from "node:path";
 
 const stub = `
 export class Plugin { constructor(app) { this.app = app } async loadData() { return {} } async saveData() {} }
-export class PluginSettingTab {} export class Setting {} export class Modal {}
+export class PluginSettingTab {} export class Setting {} export class ItemView {}
 export class Notice { hide() {} }
 export const normalizePath = (x) => x.split("/").filter(Boolean).join("/") || "/";
 // Local git server goes over real HTTP; everything else to the fake GitHub API.
@@ -154,6 +154,19 @@ try {
   assert.ok(fs.existsSync(path.join(A.root, "vault1/.git/shallow")), "clone is shallow");
   assert.equal(sh("git rev-list --count HEAD", path.join(A.root, "vault1")), "1", "only the latest commit downloaded");
   assert.equal(await B.sync(), "pulled");
+
+  // background run(): progress reaches listeners, the job clears itself, errors are kept per vault
+  const seen = [];
+  const finished = new Promise((r) => A.p.listeners.add((structural) => {
+    seen.push([...A.p.jobs.keys()].join());
+    if (structural && !A.p.jobs.size) r();
+  }));
+  A.p.run("vault1");
+  A.p.run("vault1"); // second click while running is ignored
+  assert.equal(A.p.jobs.size, 1);
+  await finished;
+  assert.ok(seen.includes("vault1") && !A.p.jobs.size && !A.p.errors.vault1);
+  A.p.listeners.clear();
 
   // Alice edits, adds and deletes, then syncs
   A.write("n1.md", "ONE\ntwo\nthree\n"); A.write("new.md", "hi\n"); fs.unlinkSync(A.file("old.md"));
