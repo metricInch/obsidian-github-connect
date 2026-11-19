@@ -1,23 +1,30 @@
-// Runs main.ts against a stubbed Obsidian + GitHub to check token refresh. `npm test`
+// Runs main.ts against a stubbed Obsidian, a fake GitHub API and a local git server. `npm test`
 import { build } from "esbuild";
 import assert from "node:assert/strict";
-import { webcrypto } from "node:crypto";
-import { execSync } from "node:child_process";
-globalThis.crypto ??= webcrypto;
+import { execSync, spawn } from "node:child_process";
+import http from "node:http";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 const stub = `
 export class Plugin { constructor(app) { this.app = app } async loadData() { return {} } async saveData() {} }
-export class PluginSettingTab {} export class Setting {} export class SuggestModal {}
-export class TFile { constructor(path) { this.path = path } } globalThis.TFile = TFile;
+export class PluginSettingTab {} export class Setting {} export class Modal {}
 export class Notice { hide() {} }
-export const arrayBufferToBase64 = () => "", base64ToArrayBuffer = () => new ArrayBuffer(0);
-export const requestUrl = (o) => globalThis.github(o);`;
+export const normalizePath = (x) => x.split("/").filter(Boolean).join("/") || "/";
+// Local git server goes over real HTTP; everything else to the fake GitHub API.
+export async function requestUrl(o) {
+  if (!o.url.startsWith("http://127.0.0.1")) return globalThis.github(o);
+  const r = await fetch(o.url, { method: o.method, headers: o.headers, body: o.body });
+  return { status: r.status, headers: Object.fromEntries(r.headers), arrayBuffer: await r.arrayBuffer() };
+}`;
 const out = await build({ entryPoints: ["main.ts"], bundle: true, write: false, format: "esm", logLevel: "error",
   plugins: [{ name: "obsidian", setup(b) {
     b.onResolve({ filter: /^obsidian$/ }, () => ({ path: "obsidian", namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({ contents: stub, loader: "js" }));
   } }] });
-const { default: GitHubConnect, gitSha } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
+const { default: GitHubConnect } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
 
 function setup(refreshWorks = true) {
   const secrets = new Map();
@@ -71,41 +78,122 @@ console.log("ok: refresh, single-flight, sign-out on failed refresh");
 }
 console.log("ok: vaults");
 
-{ // gitSha matches `git hash-object`
-  const text = "# Note\nhello é\n";
-  const want = execSync("git hash-object --stdin", { input: text }).toString().trim();
-  assert.equal(await gitSha(new TextEncoder().encode(text).buffer), want);
-}
-{ // pullFile: new, unchanged, remote-changed, edited-here
-  const { p } = setup();
-  p.s = { login: "me", expires: 0, vaults: { v: "main" }, base: {} };
-  const files = new Map(), folders = new Set();
-  const enc = (t) => new TextEncoder().encode(t).buffer, dec = (b) => new TextDecoder().decode(b);
-  p.app.vault = {
-    getAbstractFileByPath: (k) => files.has(k) ? new TFile(k) : folders.has(k) ? {} : null,
-    readBinary: async (f) => files.get(f.path),
-    modifyBinary: async (f, b) => files.set(f.path, b),
-    createBinary: async (k, b) => files.set(k, b),
-    createFolder: async (d) => folders.add(d),
-  };
-  let downloads = 0;
-  const pull = async (text) => p.pullFile("v", "a/n.md", await gitSha(enc(text)), async () => { downloads++; return enc(text); });
-  assert.equal(await pull("one"), "wrote");
-  assert.ok(folders.has("v") && folders.has("v/a"));
-  assert.equal(await pull("one"), "same");
-  assert.equal(downloads, 1, "unchanged file is not downloaded");
-  assert.equal(await pull("two"), "wrote");
-  assert.equal(dec(files.get("v/a/n.md")), "two");
-  files.set("v/a/n.md", enc("my edit"));
-  assert.equal(await pull("three"), "conflict");
-  assert.equal(dec(files.get("v/a/n.md")), "my edit", "local edit kept");
 
-  // push sends the last-synced sha; a 409 becomes "pull first"
-  let sent;
-  globalThis.github = async ({ body }) => { sent = JSON.parse(body); return { status: 409, json: {} }; };
-  p.app.vault.readBinary = async () => enc("my edit");
-  await assert.rejects(p.push(new TFile("v/a/n.md")), /Pull first/);
-  assert.equal(sent.sha, await gitSha(enc("two")));
-  assert.equal(sent.branch, "main");
+// ---- git sync, end to end: two devices against a local `git http-backend` ----
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ghc-"));
+const sh = (cmd, cwd = tmp) => execSync(cmd, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString().trim();
+const srv = path.join(tmp, "srv"), bare = path.join(srv, "IsometriaInternal", "vault1.git");
+fs.mkdirSync(path.dirname(bare), { recursive: true });
+sh(`git init -q --bare -b main ${bare} && git -C ${bare} config http.receivepack true`);
+sh(`git init -q -b main seed && cd seed && git config user.email s@x && git config user.name seed && ` +
+   `printf 'one\\ntwo\\nthree\\n' > n1.md && echo a > old.md && echo b > n2.md && mkdir -p sub && echo c > sub/deep.md && ` +
+   `git add -A && git commit -qm c1 && echo b2 > n2.md && git commit -qam c2 && echo b3 > n2.md && git commit -qam c3 && ` +
+   `git push -q ${bare} main`);
+
+const server = http.createServer((req, res) => {
+  const u = new URL(req.url, "http://x");
+  const cgi = spawn("git", ["http-backend"], { env: { ...process.env, GIT_PROJECT_ROOT: srv, GIT_HTTP_EXPORT_ALL: "1",
+    PATH_INFO: u.pathname, QUERY_STRING: u.search.slice(1), REQUEST_METHOD: req.method,
+    CONTENT_TYPE: req.headers["content-type"] ?? "", REMOTE_USER: "tester" } });
+  req.pipe(cgi.stdin);
+  const chunks = [];
+  cgi.stdout.on("data", (c) => chunks.push(c));
+  cgi.on("close", () => {
+    const out = Buffer.concat(chunks), i = out.indexOf("\r\n\r\n");
+    const head = out.subarray(0, i).toString().split("\r\n");
+    let status = 200;
+    for (const line of head) {
+      const [k, ...v] = line.split(": ");
+      if (k.toLowerCase() === "status") status = parseInt(v.join(": "));
+      else res.setHeader(k, v.join(": "));
+    }
+    res.statusCode = status;
+    res.end(out.subarray(i + 4));
+  });
+});
+await new Promise((r) => server.listen(0, "127.0.0.1", r));
+
+function adapter(root) {
+  fs.mkdirSync(root, { recursive: true });
+  const P = (x) => path.join(root, x === "/" ? "" : x);
+  return {
+    exists: async (x) => fs.existsSync(P(x)),
+    stat: async (x) => { try { const s = await fsp.stat(P(x)); return { type: s.isDirectory() ? "folder" : "file", ctime: s.ctimeMs, mtime: s.mtimeMs, size: s.size }; } catch { return null; } },
+    list: async (x) => {
+      const es = await fsp.readdir(P(x), { withFileTypes: true }), j = (n) => (x === "/" ? n : `${x}/${n}`);
+      return { files: es.filter((e) => !e.isDirectory()).map((e) => j(e.name)), folders: es.filter((e) => e.isDirectory()).map((e) => j(e.name)) };
+    },
+    readBinary: async (x) => { const b = await fsp.readFile(P(x)); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
+    read: async (x) => fsp.readFile(P(x), "utf8"),
+    writeBinary: async (x, d) => fsp.writeFile(P(x), Buffer.from(d)),
+    mkdir: async (x) => fsp.mkdir(P(x)),
+    rmdir: async (x, rec) => (rec ? fsp.rm(P(x), { recursive: true }) : fsp.rmdir(P(x))),
+    remove: async (x) => fsp.unlink(P(x)),
+  };
 }
-console.log("ok: gitSha, pullFile, push conflict");
+function device(name) {
+  const root = path.join(tmp, name), secrets = new Map([["github-connect-token", "t"]]);
+  const p = new GitHubConnect({ vault: { adapter: adapter(root) }, secretStorage: { getSecret: (k) => secrets.get(k) ?? null, setSecret: (k, v) => secrets.set(k, v) } });
+  p.s = { login: name, id: 1, expires: 0, synced: {}, merging: {} };
+  p.base = `http://127.0.0.1:${server.address().port}`;
+  const file = (f) => path.join(root, "vault1", f);
+  return { p, root, file, read: (f) => fs.readFileSync(file(f), "utf8"), write: (f, t) => fs.writeFileSync(file(f), t),
+    sync: () => p.sync("vault1", () => {}) };
+}
+const A = device("alice"), B = device("bob"), log = () => sh(`git -C ${bare} log --format=%an:%s main`).split("\n");
+
+try {
+  // first Pull: shallow clone into vault1/
+  assert.equal(await A.sync(), "pulled");
+  assert.equal(A.read("n2.md"), "b3\n");
+  assert.equal(A.read("sub/deep.md"), "c\n");
+  assert.ok(fs.existsSync(path.join(A.root, "vault1/.git/shallow")), "clone is shallow");
+  assert.equal(sh("git rev-list --count HEAD", path.join(A.root, "vault1")), "1", "only the latest commit downloaded");
+  assert.equal(await B.sync(), "pulled");
+
+  // Alice edits, adds and deletes, then syncs
+  A.write("n1.md", "ONE\ntwo\nthree\n"); A.write("new.md", "hi\n"); fs.unlinkSync(A.file("old.md"));
+  assert.equal(await A.sync(), "3 changes sent");
+  assert.equal(log()[0], "alice:Obsidian: 3 files by alice");
+
+  // Bob edits another note: his sync merges Alice's changes in and pushes both
+  B.write("n2.md", "bob\n");
+  assert.equal(await B.sync(), "1 change sent");
+  assert.equal(B.read("new.md"), "hi\n");
+  assert.ok(!fs.existsSync(B.file("old.md")), "Alice's delete reached Bob");
+  assert.equal(B.read("n1.md"), "ONE\ntwo\nthree\n");
+  assert.equal(await A.sync(), "up to date");
+  assert.equal(A.read("n2.md"), "bob\n", "Bob's edit reached Alice");
+
+  // both edit the same line: Bob gets conflict markers, must fix before Sync goes through
+  A.write("n1.md", "ONE\ntwo\nalice\n"); await A.sync();
+  B.write("n1.md", "ONE\ntwo\nbob\n");
+  await assert.rejects(B.sync(), /edited here and on GitHub: n1.md/);
+  assert.match(B.read("n1.md"), /<<<<<<<[\s\S]*bob[\s\S]*alice[\s\S]*>>>>>>>/);
+  await assert.rejects(B.sync(), /still has conflict markers: n1.md/);
+  B.write("n1.md", "ONE\ntwo\nalice and bob\n");
+  assert.equal(await B.sync(), "1 change sent");
+  await A.sync();
+  assert.equal(A.read("n1.md"), "ONE\ntwo\nalice and bob\n");
+  assert.equal(sh(`git -C ${bare} cat-file -p main`).split("\n").filter((l) => l.startsWith("parent")).length, 2, "merge commit has two parents");
+
+  // a plain folder with the repo's name is never overwritten
+  const C = device("carol");
+  fs.mkdirSync(path.join(C.root, "vault1")); fs.writeFileSync(C.file("mine.md"), "keep");
+  await assert.rejects(C.sync(), /already exists/);
+  assert.equal(C.read("mine.md"), "keep");
+  console.log("ok: shallow pull, sync both ways, deletes, conflict + resolve, folder guard");
+
+  // empty repo (no commits yet): Pull works, first Sync creates the first commit
+  sh(`git init -q --bare -b main ${path.join(srv, "IsometriaInternal", "empty.git")} && git -C ${path.join(srv, "IsometriaInternal", "empty.git")} config http.receivepack true`);
+  const D = device("dave");
+  assert.equal(await D.p.sync("empty", () => {}), "pulled");
+  assert.match(await D.p.sync("empty", () => {}), /empty/);
+  fs.writeFileSync(path.join(D.root, "empty", "first.md"), "first\n");
+  assert.equal(await D.p.sync("empty", () => {}), "1 change sent");
+  assert.equal(sh(`git -C ${path.join(srv, "IsometriaInternal", "empty.git")} show main:first.md`), "first");
+  console.log("ok: empty repo");
+} finally {
+  server.close();
+  fs.rmSync(tmp, { recursive: true, force: true });
+}

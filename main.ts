@@ -1,12 +1,20 @@
+import { Buffer } from "buffer";
+import git, { GitHttpRequest, GitHttpResponse } from "isomorphic-git";
 import {
-  App, Notice, Plugin, PluginSettingTab, Setting, SuggestModal, TFile,
-  RequestUrlResponse, arrayBufferToBase64, base64ToArrayBuffer, requestUrl,
+  App, DataAdapter, Modal, Notice, Plugin, PluginSettingTab, Setting, Stat,
+  RequestUrlResponse, normalizePath, requestUrl,
 } from "obsidian";
 
-// vaults: repo -> branch it was pulled from (repo lives in vault folder "<repo>/").
-// base: "<repo>/<path>" -> git blob sha at the last sync, to tell local edits from remote ones.
-interface Settings { login: string; expires: number; vaults: Record<string, string>; base: Record<string, string> }
-const DEFAULTS: Settings = { login: "", expires: 0, vaults: {}, base: {} };
+// isomorphic-git needs Node's Buffer; Obsidian mobile has none.
+(globalThis as any).Buffer ??= Buffer;
+
+// synced: repo -> last successful sync (ms). merging: repo -> unfinished merge waiting for the user.
+interface Settings {
+  login: string; id: number; expires: number;
+  synced: Record<string, number>;
+  merging: Record<string, { theirs: string; files: string[] }>;
+}
+const DEFAULTS: Settings = { login: "", id: 0, expires: 0, synced: {}, merging: {} };
 // GitHub App "Obsidian-GitHub-Connect", owned by and installable only on IsometriaInternal.
 const CLIENT_ID = "Iv23liN72h2n3K7zuhDS"; // public by design: device flow has no secret
 const OWNER = "IsometriaInternal";
@@ -16,6 +24,8 @@ const FORM = { Accept: "application/json", "Content-Type": "application/x-www-fo
 
 export default class GitHubConnect extends Plugin {
   s: Settings = { ...DEFAULTS };
+  base = "https://github.com"; // git host; tests point it at a local server
+  busy = new Set<string>();
 
   // Token lives in Obsidian's secret storage, not in the vault's data.json.
   get token() { return this.app.secretStorage.getSecret(SECRET) ?? ""; }
@@ -33,7 +43,7 @@ export default class GitHubConnect extends Plugin {
 
   async signOut() {
     this.token = this.refresh = this.s.login = "";
-    this.s.expires = 0;
+    this.s.expires = this.s.id = 0;
     await this.save();
   }
 
@@ -51,26 +61,28 @@ export default class GitHubConnect extends Plugin {
     })().finally(() => (this.renewing = undefined)));
   }
 
+  async fresh() {
+    if (this.s.expires && Date.now() > this.s.expires - 60_000) await this.renew();
+  }
+
   async onload() {
     const d = (await this.loadData()) ?? {};
     if (d.token) { this.token = d.token; delete d.token; } // move 0.1.0 plaintext token out of data.json
-    this.s = { ...DEFAULTS, vaults: {}, base: {}, ...d };
+    this.s = { ...DEFAULTS, synced: {}, merging: {}, ...d };
     await this.save();
     this.addSettingTab(new Tab(this.app, this));
+    this.addRibbonIcon("github", "GitHub vaults", () => new VaultsModal(this).open());
     this.addCommand({ id: "sign-in", name: "Sign in", callback: () => this.signIn().catch((e) => new Notice(`GitHub: ${e.message}`)) });
-    this.addCommand({ id: "pull-vault", name: "Pull a vault", callback: () => this.pickVault() });
-    this.addCommand({ id: "push-note", name: "Push current note", checkCallback: (c) => this.onNote(c, (f) => this.push(f)) });
-    this.addCommand({ id: "pull-note", name: "Pull current note", checkCallback: (c) => this.onNote(c, (f) => this.pull(f)) });
+    this.addCommand({ id: "vaults", name: "Open vaults", callback: () => new VaultsModal(this).open() });
+    this.addCommand({ id: "sync-current", name: "Sync the vault of the current note", checkCallback: (checking) => {
+      const repo = this.app.workspace.getActiveFile()?.path.split("/")[0];
+      if (!repo || !this.s.synced[repo]) return false;
+      if (!checking) this.sync(repo, () => {}).then((m) => new Notice(`${repo}: ${m}`), (e) => new Notice(`${repo}: ${e.message}`, 15000));
+      return true;
+    } });
   }
 
   save() { return this.saveData(this.s); }
-
-  onNote(checking: boolean, fn: (f: TFile) => Promise<void>) {
-    const f = this.app.workspace.getActiveFile();
-    if (!f || !this.where(f)) return false; // only notes inside a pulled vault folder
-    if (!checking) fn(f).catch((e) => new Notice(`GitHub: ${e.message}`));
-    return true;
-  }
 
   // OAuth device flow: only the public client ID is needed, no secret ships in the plugin.
   async signIn() {
@@ -90,7 +102,8 @@ export default class GitHubConnect extends Plugin {
         body: `client_id=${CLIENT_ID}&device_code=${d.device_code}&grant_type=urn:ietf:params:oauth:grant-type:device_code` })).json;
       if (t.access_token) {
         this.keep(t);
-        this.s.login = (await this.gh("/user")).json.login;
+        const me = (await this.gh("/user")).json;
+        this.s.login = me.login; this.s.id = me.id;
         await this.save();
         n.hide();
         return new Notice(`Signed in as ${this.s.login}`);
@@ -103,7 +116,7 @@ export default class GitHubConnect extends Plugin {
   }
 
   async gh(path: string, method = "GET", body?: object, retry = true): Promise<RequestUrlResponse> {
-    if (this.s.expires && Date.now() > this.s.expires - 60_000) await this.renew();
+    await this.fresh();
     const r = await requestUrl({ url: `https://api.github.com${path}`, method, throw: false,
       body: body && JSON.stringify(body),
       headers: { Authorization: `Bearer ${this.token}`, Accept: "application/vnd.github+json" } });
@@ -135,111 +148,230 @@ export default class GitHubConnect extends Plugin {
     return names.sort((a, b) => a.localeCompare(b));
   }
 
-  where(f: TFile) {
-    const [repo, ...rest] = f.path.split("/");
-    return rest.length && this.s.vaults[repo] ? { repo, path: rest.join("/"), branch: this.s.vaults[repo] } : null;
+  // Shared options for every isomorphic-git call. Each vault folder "<repo>/" is its own git repo.
+  get g() {
+    const auth = () => ({ username: "x-access-token", password: this.token });
+    return {
+      fs: vaultFs(this.app.vault.adapter), http: { request: gitHttp }, onAuth: auth,
+      onAuthFailure: async () => ((await this.renew()) ? auth() : { cancel: true }),
+    };
   }
 
-  async pickVault() {
-    if (!this.token) return new Notice("GitHub: sign in first");
-    const names = await this.vaults().catch((e) => { new Notice(`GitHub: ${e.message}`); return null; });
-    if (!names) return;
-    if (!names.length) return new Notice(`No ${OWNER} vaults: ask an org owner to add the app to a repo`);
-    new VaultPicker(this, names).open();
+  get author() {
+    return { name: this.s.login, email: `${this.s.id ? `${this.s.id}+` : ""}${this.s.login}@users.noreply.github.com` };
   }
 
-  // Pull every file of a repo into "<repo>/". Unchanged files are skipped without downloading;
-  // files edited locally since the last sync are left alone and reported.
-  async pullVault(repo: string) {
-    const n = new Notice(`Pulling ${repo}…`, 0);
+  // Pull (first time: shallow clone) or sync: commit local changes, fetch, merge, push.
+  // Returns a one-line summary; throws with a readable message.
+  async sync(repo: string, say: (s: string) => void): Promise<string> {
+    if (!this.token) throw new Error("sign in first");
+    if (this.busy.has(repo)) throw new Error("already syncing");
+    this.busy.add(repo);
     try {
-      const branch = this.s.vaults[repo] ?? (await this.json(`/repos/${OWNER}/${repo}`)).default_branch;
-      const tree = await this.json(`/repos/${OWNER}/${repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`);
-      this.s.vaults[repo] = branch;
-      const count = { wrote: 0, same: 0, conflict: [] as string[] };
-      for (const e of tree.tree) {
-        // ponytail: skips dot-paths (.obsidian, .github, .gitignore); the vault's own config stays local
-        if (e.type !== "blob" || e.path.split("/").some((x: string) => x.startsWith("."))) continue;
-        const r = await this.pullFile(repo, e.path, e.sha, async () =>
-          base64ToArrayBuffer((await this.json(`/repos/${OWNER}/${repo}/git/blobs/${e.sha}`)).content.replace(/\s/g, "")));
-        if (r === "conflict") count.conflict.push(e.path); else count[r]++;
-      }
-      await this.save();
-      new Notice(`${repo}: ${count.wrote} updated, ${count.same} unchanged` +
-        (count.conflict.length ? `, ${count.conflict.length} kept (edited here): ${count.conflict.slice(0, 5).join(", ")}` : "") +
-        (tree.truncated ? ". Repo too large, not every file was listed." : ""), 10000);
-    } finally { n.hide(); }
-  }
+      await this.fresh();
+      const g = this.g, fs = g.fs, dir = repo, a = this.app.vault.adapter;
+      const onProgress = (p: { phase: string; loaded: number; total?: number }) =>
+        say(`${p.phase}${p.total ? ` ${Math.round((p.loaded / p.total) * 100)}%` : ""}`);
 
-  async pullFile(repo: string, path: string, sha: string, download: () => Promise<ArrayBuffer>) {
-    const key = `${repo}/${path}`, vault = this.app.vault, f = vault.getAbstractFileByPath(key);
-    if (f instanceof TFile) {
-      const local = await gitSha(await vault.readBinary(f));
-      if (local === sha) { this.s.base[key] = sha; return "same" as const; }
-      if (local !== this.s.base[key]) return "conflict" as const;
-      await vault.modifyBinary(f, await download());
-    } else if (f) return "conflict" as const; // a folder has that name
-    else {
-      const dirs = key.split("/").slice(0, -1);
-      for (let i = 1; i <= dirs.length; i++) {
-        const d = dirs.slice(0, i).join("/");
-        if (!vault.getAbstractFileByPath(d)) await vault.createFolder(d);
+      if (!(await a.exists(`${repo}/.git`))) {
+        if (await a.exists(repo)) throw new Error(`a folder "${repo}" already exists here; rename or remove it, then Pull`);
+        try {
+          await git.clone({ ...g, dir, url: `${this.base}/${OWNER}/${repo}.git`, depth: 1, singleBranch: true, noTags: true, onProgress });
+        } catch (e) {
+          if (await a.exists(repo)) await a.rmdir(repo, true); // a half-cloned folder would block the next Pull
+          throw e;
+        }
+        // Empty repo: isomorphic-git would start on "master"; GitHub's default is "main".
+        if (!(await git.resolveRef({ fs, dir, ref: "HEAD" }).catch(() => null)))
+          await git.writeRef({ fs, dir, ref: "HEAD", value: "refs/heads/main", symbolic: true, force: true });
+        return this.done(repo, "pulled");
       }
-      await vault.createBinary(key, await download());
+
+      const author = this.author, branch = (await git.currentBranch({ fs, dir })) ?? "main";
+      const merging = this.s.merging[repo];
+      if (merging) {
+        for (const f of merging.files)
+          if ((await a.exists(`${repo}/${f}`)) && (await a.read(`${repo}/${f}`)).includes("<<<<<<<"))
+            throw new Error(`still has conflict markers: ${f}. Edit it, then Sync`);
+      }
+
+      say("Saving your changes");
+      const changed = await stageAll(fs, dir);
+      if (merging) {
+        const ours = await git.resolveRef({ fs, dir, ref: "HEAD" });
+        await git.commit({ fs, dir, author, parent: [ours, merging.theirs], message: `Merge from GitHub (resolved in Obsidian by ${author.name})` });
+        delete this.s.merging[repo];
+        await this.save();
+      } else if (changed) {
+        await git.commit({ fs, dir, author, message: `Obsidian: ${changed} file${changed > 1 ? "s" : ""} by ${author.name}` });
+      }
+
+      say("Fetching");
+      // No depth here: in a shallow repo this brings only the commits since our last sync.
+      await git.fetch({ ...g, dir, singleBranch: true, ref: branch, tags: false, onProgress });
+      const theirs = await git.resolveRef({ fs, dir, ref: `refs/remotes/origin/${branch}` }).catch(() => null);
+      const before = await git.resolveRef({ fs, dir, ref: "HEAD" }).catch(() => null);
+      if (!before) return this.done(repo, "empty: add a note to this folder, then Sync");
+      if (theirs) try {
+        await git.merge({ fs, dir, ours: branch, theirs, author, abortOnConflict: false,
+          message: `Merge from GitHub into ${author.name}'s Obsidian` });
+      } catch (e: any) {
+        if (e?.code !== "MergeConflictError") throw e;
+        const files = e.data.bothModified.length ? e.data.bothModified : e.data.filepaths;
+        this.s.merging[repo] = { theirs, files };
+        await this.save();
+        throw new Error(`edited here and on GitHub: ${files.join(", ")}. Fix the <<<<<<< / >>>>>>> parts in those notes, then Sync`);
+      }
+      if ((await git.resolveRef({ fs, dir, ref: "HEAD" })) !== before) {
+        say("Updating notes");
+        await git.checkout({ fs, dir, ref: branch });
+      }
+
+      say("Sending");
+      const r = await git.push({ ...g, dir, ref: branch, onProgress });
+      if (!r.ok) throw new Error(`GitHub refused the push: ${r.error ?? "unknown"}`);
+      return this.done(repo, changed ? `${changed} change${changed > 1 ? "s" : ""} sent` : "up to date");
+    } finally {
+      this.busy.delete(repo);
     }
-    this.s.base[key] = sha;
-    return "wrote" as const;
   }
 
-  contents(repo: string, path: string) {
-    return `/repos/${OWNER}/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
-  }
-
-  async pull(f: TFile) {
-    const w = this.where(f)!;
-    const r = await this.gh(`${this.contents(w.repo, w.path)}?ref=${encodeURIComponent(w.branch)}`);
-    if (r.status === 404) throw new Error(`${w.path} is not in ${w.repo}`);
-    if (r.status >= 400) throw new Error(r.json?.message ?? `HTTP ${r.status}`);
-    const res = await this.pullFile(w.repo, w.path, r.json.sha, async () => base64ToArrayBuffer(r.json.content.replace(/\s/g, "")));
+  async done(repo: string, msg: string) {
+    this.s.synced[repo] = Date.now();
     await this.save();
-    // ponytail: no merge; a note edited on both sides is kept local and the user resolves it on GitHub
-    new Notice(res === "conflict" ? `${f.path} was edited here and on GitHub; kept your version` :
-      res === "same" ? `${f.path} is up to date` : `Pulled ${f.path}`);
-  }
-
-  // Push with the sha of the last sync: GitHub refuses (409/422) if someone changed the file since.
-  async push(f: TFile) {
-    const w = this.where(f)!, key = f.path;
-    const r = await this.gh(this.contents(w.repo, w.path), "PUT", {
-      message: `${this.s.base[key] ? "Update" : "Add"} ${w.path}`,
-      content: arrayBufferToBase64(await this.app.vault.readBinary(f)),
-      branch: w.branch,
-      sha: this.s.base[key],
-    });
-    if (r.status === 409 || r.status === 422) throw new Error(`${w.path} changed on GitHub since your last pull. Pull first.`);
-    if (r.status >= 400) throw new Error(r.json?.message ?? `HTTP ${r.status}`);
-    this.s.base[key] = r.json.content.sha;
-    await this.save();
-    new Notice(`Pushed ${f.path}`);
+    return msg;
   }
 }
 
-// Git's blob id: sha1("blob <size>\0" + bytes). Lets us compare local files with the repo without downloading.
-export async function gitSha(buf: ArrayBuffer) {
-  const head = new TextEncoder().encode(`blob ${buf.byteLength}\0`);
-  const all = new Uint8Array(head.length + buf.byteLength);
-  all.set(head); all.set(new Uint8Array(buf), head.length);
-  return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-1", all)), (b) => b.toString(16).padStart(2, "0")).join("");
+// git add -A; returns how many files changed since the last commit.
+async function stageAll(fs: ReturnType<typeof vaultFs>, dir: string) {
+  let n = 0;
+  for (const [filepath, head, work, stage] of await git.statusMatrix({ fs, dir })) {
+    if (head === 1 && work === 1 && stage === 1) continue;
+    if (work === 0) { if (stage) await git.remove({ fs, dir, filepath }); }
+    else await git.add({ fs, dir, filepath });
+    if (!(head === 1 && work === 1)) n++;
+  }
+  return n;
 }
 
-class VaultPicker extends SuggestModal<string> {
-  constructor(private p: GitHubConnect, private names: string[]) {
-    super(p.app);
-    this.setPlaceholder(`Pull a ${OWNER} vault into a folder of the same name`);
+// isomorphic-git over Obsidian's file adapter, so the same code works on desktop and mobile.
+export function vaultFs(a: DataAdapter) {
+  const p = (x: string) => normalizePath(x);
+  const fail = (code: string, x: string) => Object.assign(new Error(`${code}: ${x}`), { code });
+  const parentOf = (x: string) => (x.includes("/") ? x.slice(0, x.lastIndexOf("/")) : "");
+  const stats = (s: Stat) => ({
+    type: s.type === "folder" ? "dir" : "file", mode: s.type === "folder" ? 0o40000 : 0o100644, size: s.size,
+    ino: 0, uid: 0, gid: 0, dev: 0, ctimeMs: s.ctime, mtimeMs: s.mtime,
+    isFile: () => s.type === "file", isDirectory: () => s.type === "folder", isSymbolicLink: () => false,
+  });
+  const must = async (x: string) => { const s = await a.stat(x); if (!s) throw fail("ENOENT", x); return s; };
+  const promises = {
+    async readFile(path: string, opts?: string | { encoding?: string }) {
+      const x = p(path);
+      if ((await must(x)).type === "folder") throw fail("EISDIR", x);
+      const buf = await a.readBinary(x);
+      return (typeof opts === "string" ? opts : opts?.encoding) ? new TextDecoder().decode(buf) : new Uint8Array(buf);
+    },
+    async writeFile(path: string, data: string | Uint8Array) {
+      const x = p(path), dir = parentOf(x);
+      if (dir && !(await a.exists(dir))) throw fail("ENOENT", x);
+      const b = typeof data === "string" ? new TextEncoder().encode(data) : data;
+      await a.writeBinary(x, b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer);
+    },
+    async mkdir(path: string) {
+      const x = p(path), dir = parentOf(x);
+      if (await a.exists(x)) throw fail("EEXIST", x);
+      if (dir && !(await a.exists(dir))) throw fail("ENOENT", x);
+      await a.mkdir(x);
+    },
+    async rmdir(path: string) {
+      const x = p(path), l = await a.list(x);
+      if (l.files.length || l.folders.length) throw fail("ENOTEMPTY", x);
+      await a.rmdir(x, false);
+    },
+    async unlink(path: string) { const x = p(path); await must(x); await a.remove(x); },
+    async stat(path: string) { return stats(await must(p(path))); },
+    async lstat(path: string) { return stats(await must(p(path))); },
+    async readdir(path: string) {
+      const x = p(path);
+      if ((await must(x)).type !== "folder") throw fail("ENOTDIR", x);
+      const l = await a.list(x);
+      return [...l.files, ...l.folders].map((f) => f.slice(f.lastIndexOf("/") + 1));
+    },
+    async readlink(path: string): Promise<string> { throw fail("ENOENT", path); },
+    async symlink(_t: string, path: string) { throw fail("ENOSYS", path); },
+  };
+  return { promises };
+}
+
+// isomorphic-git HTTP through requestUrl: no CORS limits, works on mobile.
+export async function gitHttp({ url, method = "GET", headers = {}, body }: GitHttpRequest): Promise<GitHttpResponse> {
+  let data: ArrayBuffer | undefined;
+  if (body) {
+    const parts: Uint8Array[] = [];
+    for await (const c of body as AsyncIterable<Uint8Array>) parts.push(c);
+    const all = new Uint8Array(parts.reduce((n, c) => n + c.length, 0));
+    let o = 0;
+    for (const c of parts) { all.set(c, o); o += c.length; }
+    data = all.buffer;
   }
-  getSuggestions(q: string) { return this.names.filter((n) => n.toLowerCase().includes(q.toLowerCase())); }
-  renderSuggestion(n: string, el: HTMLElement) { el.setText(this.p.s.vaults[n] ? `${n}  (pulled, update)` : n); }
-  onChooseSuggestion(n: string) { this.p.pullVault(n).catch((e) => new Notice(`GitHub: ${e.message}`)); }
+  const r = await requestUrl({ url, method, headers, body: data, throw: false });
+  const h: Record<string, string> = {};
+  for (const [k, v] of Object.entries(r.headers)) h[k.toLowerCase()] = v;
+  const bytes = new Uint8Array(r.arrayBuffer);
+  return { url, method, statusCode: r.status, statusMessage: String(r.status), headers: h, body: (async function* () { yield bytes; })() };
+}
+
+const ago = (t: number) => {
+  const m = Math.round((Date.now() - t) / 60000);
+  return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`;
+};
+
+// One row per vault the user can access, each with its own Pull / Sync button.
+class VaultsModal extends Modal {
+  constructor(private p: GitHubConnect) { super(p.app); }
+
+  onOpen() { this.render(); }
+
+  async render() {
+    const { contentEl: el, p } = this;
+    this.titleEl.setText(`${OWNER} vaults`);
+    el.empty();
+    if (!p.token) {
+      new Setting(el).setName("Not signed in").addButton((b) => b.setButtonText("Sign in").setCta()
+        .onClick(async () => { await p.signIn(); this.render(); }));
+      return;
+    }
+    const loading = el.createEl("p", { text: "Loading…" });
+    const names = await p.vaults().catch((e) => { loading.setText(`Could not load vaults: ${e.message}`); return null; });
+    if (!names) return;
+    loading.remove();
+    if (!names.length) el.createEl("p", { text: "No vaults yet. Ask an org owner to add the app to a repo." });
+    for (const name of names) {
+      const here = await p.app.vault.adapter.exists(`${name}/.git`);
+      const row = new Setting(el).setName(name);
+      const m = p.s.merging[name];
+      row.setDesc(m ? `Conflicts to fix: ${m.files.join(", ")}`
+        : here ? `In folder ${name}/ · synced ${p.s.synced[name] ? ago(p.s.synced[name]) : "never"}` : "Not on this device");
+      row.addButton((b) => {
+        b.setButtonText(here ? "Sync" : "Pull").onClick(async () => {
+          b.setDisabled(true);
+          try {
+            const msg = await p.sync(name, (t) => row.setDesc(t));
+            new Notice(`${name}: ${msg}`);
+            this.render();
+          } catch (e: any) {
+            row.setDesc(`Failed: ${e.message}`);
+            b.setDisabled(false);
+          }
+        });
+        if (!here) b.setCta();
+      });
+    }
+  }
+
+  onClose() { this.contentEl.empty(); }
 }
 
 class Tab extends PluginSettingTab {
@@ -254,12 +386,12 @@ class Tab extends PluginSettingTab {
         if (p.token) await p.signOut(); else await p.signIn();
         this.display();
       }));
+    new Setting(el).setName("Vaults")
+      .setDesc(`Pull or sync any ${OWNER} repo you can access. Also on the ribbon (GitHub icon).`)
+      .addButton((b) => b.setButtonText("Open vaults").setCta().onClick(() => new VaultsModal(p).open()));
     new Setting(el).setName("Repository access")
       .setDesc(`The app only reaches ${OWNER} repos it is installed on. Org owners pick them here.`)
       .addButton((b) => b.setButtonText("Manage").onClick(() =>
         window.open(`https://github.com/organizations/${OWNER}/settings/installations`)));
-    if (p.token) new Setting(el).setName("Vaults")
-      .setDesc(`Pull any ${OWNER} repo you can access into a folder of the same name.`)
-      .addButton((b) => b.setButtonText("Pull a vault").onClick(() => p.pickVault()));
   }
 }

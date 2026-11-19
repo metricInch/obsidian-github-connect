@@ -6,16 +6,18 @@ Sign in to GitHub without a password or personal token (OAuth device flow via a 
 Built for the **IsometriaInternal** organization. The GitHub App `Obsidian-GitHub-Connect` (client ID `Iv23liN72h2n3K7zuhDS`, public by design) is owned by the org and can only be installed there.
 
 1. An org owner installs the app on the vault repos: Org → Settings → GitHub Apps → Obsidian-GitHub-Connect → Configure → **Only select repositories**.
-2. In Obsidian: Settings → GitHub Connect → **Sign in** (enter the code on github.com and approve), then **Pull a vault**: pick any IsometriaInternal repo the app is installed on that you can access.
+2. In Obsidian: Settings → GitHub Connect → **Sign in** (enter the code on github.com and approve), then open **GitHub vaults** (ribbon icon or command): every IsometriaInternal repo you can access is listed with its own **Pull** / **Sync** button.
 
 Access is the intersection of repos the app is installed on and repos the user can reach. Remove a user from the repo, team or org to cut them off.
 
-## Commands
-- **Pull a vault**: pick a repo; all its files land in a vault folder with the repo's name. Run it again to update. Files under dot-folders (`.obsidian`, `.github`) are skipped.
-- **Push current note**: send a note inside a pulled folder back to its repo.
-- **Pull current note**: update one note from its repo.
+## How sync works
+Real git in the plugin ([isomorphic-git](https://isomorphic-git.org)), no git install needed, same code on desktop and mobile.
 
-Sync never overwrites silently: a pull keeps notes you edited since the last sync (and lists them), and a push is refused if someone changed the file on GitHub since your last pull. No merging yet; resolve on GitHub.
+- **Pull** (first time): shallow clone, only the latest commit, into a vault folder named after the repo. Each folder is its own git repo and syncs on its own.
+- **Sync**: commit everything changed in that folder (edits, new and deleted notes) as one commit, fetch only the new commits, merge, push.
+- **Conflicts**: if a note was edited here and on GitHub, Sync stops and leaves `<<<<<<<` / `>>>>>>>` markers in it. Fix the note, Sync again; that makes the merge commit. Sync refuses while markers remain.
+- A folder that already exists without git is never overwritten: rename it, then Pull.
+- Empty repos work: Pull, add notes, Sync makes the first commit on `main`.
 
 ## Install for testing
 With [BRAT](https://github.com/TfTHacker/obsidian42-brat): Add beta plugin → `metricInch/obsidian-github-connect`.
