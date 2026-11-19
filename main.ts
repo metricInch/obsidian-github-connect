@@ -3,8 +3,11 @@ import {
   RequestUrlResponse, arrayBufferToBase64, base64ToArrayBuffer, requestUrl,
 } from "obsidian";
 
-interface Settings { clientId: string; login: string; expires: number; owner: string; repo: string; branch: string }
-const DEFAULTS: Settings = { clientId: "", login: "", expires: 0, owner: "", repo: "", branch: "main" };
+interface Settings { login: string; expires: number; repo: string; branch: string }
+const DEFAULTS: Settings = { login: "", expires: 0, repo: "", branch: "main" };
+// GitHub App "Obsidian-GitHub-Connect", owned by and installable only on IsometriaInternal.
+const CLIENT_ID = "Iv23liN72h2n3K7zuhDS"; // public by design: device flow has no secret
+const OWNER = "IsometriaInternal";
 const SECRET = "github-connect-token";
 const REFRESH = "github-connect-refresh";
 const FORM = { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" };
@@ -38,7 +41,7 @@ export default class GitHubConnect extends Plugin {
     return (this.renewing ??= (async () => {
       if (!this.refresh) return false;
       const t = (await requestUrl({ url: "https://github.com/login/oauth/access_token", method: "POST", throw: false, headers: FORM,
-        body: `client_id=${this.s.clientId}&grant_type=refresh_token&refresh_token=${encodeURIComponent(this.refresh)}` })).json;
+        body: `client_id=${CLIENT_ID}&grant_type=refresh_token&refresh_token=${encodeURIComponent(this.refresh)}` })).json;
       if (!t.access_token) return false;
       this.keep(t);
       await this.save();
@@ -68,9 +71,8 @@ export default class GitHubConnect extends Plugin {
 
   // OAuth device flow: only the public client ID is needed, no secret ships in the plugin.
   async signIn() {
-    if (!this.s.clientId) return new Notice("Set the GitHub App client ID in settings first");
     const d = (await requestUrl({ url: "https://github.com/login/device/code", method: "POST", throw: false,
-      headers: FORM, body: `client_id=${this.s.clientId}` })).json;
+      headers: FORM, body: `client_id=${CLIENT_ID}` })).json;
     if (!d.device_code) return new Notice(`GitHub: ${d.error_description ?? d.error ?? "check the client ID and that Device Flow is enabled"}`);
     await navigator.clipboard.writeText(d.user_code);
     const n = new Notice(`Code ${d.user_code} copied. Paste it on the GitHub page.`, 0);
@@ -81,7 +83,7 @@ export default class GitHubConnect extends Plugin {
     while (Date.now() < deadline) {
       await sleep(wait * 1000);
       const t = (await requestUrl({ url: "https://github.com/login/oauth/access_token", method: "POST", throw: false, headers: FORM,
-        body: `client_id=${this.s.clientId}&device_code=${d.device_code}&grant_type=urn:ietf:params:oauth:grant-type:device_code` })).json;
+        body: `client_id=${CLIENT_ID}&device_code=${d.device_code}&grant_type=urn:ietf:params:oauth:grant-type:device_code` })).json;
       if (t.access_token) {
         this.keep(t);
         this.s.login = (await this.gh("/user")).json.login;
@@ -111,9 +113,9 @@ export default class GitHubConnect extends Plugin {
 
   contentsUrl(f: TFile) {
     if (!this.token) throw new Error("not signed in");
-    if (!this.s.owner || !this.s.repo) throw new Error("set owner and repo in settings");
+    if (!this.s.repo) throw new Error("set the repository in settings");
     const p = f.path.split("/").map(encodeURIComponent).join("/");
-    return `/repos/${this.s.owner}/${this.s.repo}/contents/${p}`;
+    return `/repos/${OWNER}/${this.s.repo}/contents/${p}`;
   }
 
   async remote(f: TFile) {
@@ -156,12 +158,14 @@ class Tab extends PluginSettingTab {
         if (p.token) await p.signOut(); else await p.signIn();
         this.display();
       }));
-    const text = (name: string, key: "clientId" | "owner" | "repo" | "branch", desc = "") =>
+    new Setting(el).setName("Repository access")
+      .setDesc(`The app only reaches ${OWNER} repos it is installed on. Org owners pick them here.`)
+      .addButton((b) => b.setButtonText("Manage").onClick(() =>
+        window.open(`https://github.com/organizations/${OWNER}/settings/installations`)));
+    const text = (name: string, key: "repo" | "branch", desc = "") =>
       new Setting(el).setName(name).setDesc(desc).addText((t) =>
         t.setValue(p.s[key]).onChange(async (v) => { p.s[key] = v.trim(); await p.save(); }));
-    text("GitHub App client ID", "clientId", "From your GitHub App page (Device Flow enabled).");
-    text("Owner", "owner");
-    text("Repository", "repo");
+    text("Repository", "repo", `Vault repo in ${OWNER}, e.g. my-vault.`);
     text("Branch", "branch");
   }
 }

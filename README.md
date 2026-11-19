@@ -3,9 +3,12 @@
 Sign in to GitHub without a password or personal token (OAuth device flow via a GitHub App), then push and pull notes to a repository.
 
 ## Setup
-1. Create a GitHub App: Settings → Developer settings → GitHub Apps → New. Enable **Device Flow**, turn off the webhook, give Repository permissions → **Contents: Read & write**, and keep "Expire user authorization tokens" checked: the plugin refreshes the 8-hour token itself (device-flow tokens refresh without a client secret). Copy the Client ID.
-2. Install the app on the repo you sync to.
-3. In Obsidian: Settings → GitHub Connect → paste the Client ID, set owner/repo/branch, click **Sign in**.
+Built for the **IsometriaInternal** organization. The GitHub App `Obsidian-GitHub-Connect` (client ID `Iv23liN72h2n3K7zuhDS`, public by design) is owned by the org and can only be installed there.
+
+1. An org owner installs the app on the vault repos: Org → Settings → GitHub Apps → Obsidian-GitHub-Connect → Configure → **Only select repositories**.
+2. In Obsidian: Settings → GitHub Connect → **Sign in** (paste the copied code on github.com and approve), then set the repository name.
+
+Access is the intersection of repos the app is installed on and repos the user can reach. Remove a user from the repo, team or org to cut them off.
 
 ## Commands
 - **Push current note**: create or update the note at the same path in the repo.

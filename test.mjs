@@ -18,7 +18,7 @@ const { default: GitHubConnect } = await import("data:text/javascript;base64," +
 function setup(refreshWorks = true) {
   const secrets = new Map();
   const p = new GitHubConnect({ secretStorage: { getSecret: (k) => secrets.get(k) ?? null, setSecret: (k, v) => secrets.set(k, v) } });
-  p.s = { clientId: "Iv23test", login: "me", expires: 0, owner: "o", repo: "r", branch: "main" };
+  p.s = { login: "me", expires: 0, repo: "r", branch: "main" };
   p.token = "old"; p.refresh = "r1";
   const calls = { refresh: 0 };
   globalThis.github = async ({ url, body, headers }) => {
