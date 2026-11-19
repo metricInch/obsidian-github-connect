@@ -16,3 +16,7 @@ With [BRAT](https://github.com/TfTHacker/obsidian42-brat): Add beta plugin → `
 
 ## Build
 `npm i && npm run build`, then copy `main.js` and `manifest.json` to `<vault>/.obsidian/plugins/github-connect/`.
+
+## Security
+- Requires Obsidian 1.11.4+. The GitHub token is kept in Obsidian's secret storage (`app.secretStorage`), not in the vault's `data.json`, so it does not travel with a synced or committed vault.
+- The token can only reach repositories where the GitHub App is installed **and** the signed-in user has access, with only the app's permissions (Contents). Revoke it under GitHub → Settings → Applications.

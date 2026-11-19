@@ -3,15 +3,23 @@ import {
   arrayBufferToBase64, base64ToArrayBuffer, requestUrl,
 } from "obsidian";
 
-interface Settings { clientId: string; token: string; login: string; owner: string; repo: string; branch: string }
-const DEFAULTS: Settings = { clientId: "", token: "", login: "", owner: "", repo: "", branch: "main" };
+interface Settings { clientId: string; login: string; owner: string; repo: string; branch: string }
+const DEFAULTS: Settings = { clientId: "", login: "", owner: "", repo: "", branch: "main" };
+const SECRET = "github-connect-token";
 const FORM = { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" };
 
 export default class GitHubConnect extends Plugin {
   s: Settings = { ...DEFAULTS };
 
+  // Token lives in Obsidian's secret storage, not in the vault's data.json.
+  get token() { return this.app.secretStorage.getSecret(SECRET) ?? ""; }
+  set token(v: string) { this.app.secretStorage.setSecret(SECRET, v); }
+
   async onload() {
-    this.s = { ...DEFAULTS, ...(await this.loadData()) };
+    const d = (await this.loadData()) ?? {};
+    if (d.token) { this.token = d.token; delete d.token; } // move 0.1.0 plaintext token out of data.json
+    this.s = { ...DEFAULTS, ...d };
+    await this.save();
     this.addSettingTab(new Tab(this.app, this));
     this.addCommand({ id: "sign-in", name: "Sign in", callback: () => this.signIn().catch((e) => new Notice(`GitHub: ${e.message}`)) });
     this.addCommand({ id: "push-note", name: "Push current note", checkCallback: (c) => this.onNote(c, (f) => this.push(f)) });
@@ -44,7 +52,7 @@ export default class GitHubConnect extends Plugin {
       const t = (await requestUrl({ url: "https://github.com/login/oauth/access_token", method: "POST", throw: false, headers: FORM,
         body: `client_id=${this.s.clientId}&device_code=${d.device_code}&grant_type=urn:ietf:params:oauth:grant-type:device_code` })).json;
       if (t.access_token) {
-        this.s.token = t.access_token;
+        this.token = t.access_token;
         this.s.login = (await this.gh("/user")).json.login;
         await this.save();
         n.hide();
@@ -60,13 +68,13 @@ export default class GitHubConnect extends Plugin {
   async gh(path: string, method = "GET", body?: object) {
     const r = await requestUrl({ url: `https://api.github.com${path}`, method, throw: false,
       body: body && JSON.stringify(body),
-      headers: { Authorization: `Bearer ${this.s.token}`, Accept: "application/vnd.github+json" } });
-    if (r.status === 401) { this.s.token = ""; await this.save(); throw new Error("session expired, run Sign in again"); }
+      headers: { Authorization: `Bearer ${this.token}`, Accept: "application/vnd.github+json" } });
+    if (r.status === 401) { this.token = ""; await this.save(); throw new Error("session expired, run Sign in again"); }
     return r;
   }
 
   contentsUrl(f: TFile) {
-    if (!this.s.token) throw new Error("not signed in");
+    if (!this.token) throw new Error("not signed in");
     if (!this.s.owner || !this.s.repo) throw new Error("set owner and repo in settings");
     const p = f.path.split("/").map(encodeURIComponent).join("/");
     return `/repos/${this.s.owner}/${this.s.repo}/contents/${p}`;
@@ -107,9 +115,9 @@ class Tab extends PluginSettingTab {
     const { containerEl: el, p } = this;
     el.empty();
     new Setting(el).setName("Account")
-      .setDesc(p.s.token ? `Signed in as ${p.s.login}` : "Not signed in")
-      .addButton((b) => b.setButtonText(p.s.token ? "Sign out" : "Sign in").onClick(async () => {
-        if (p.s.token) { p.s.token = p.s.login = ""; await p.save(); } else await p.signIn();
+      .setDesc(p.token ? `Signed in as ${p.s.login}` : "Not signed in")
+      .addButton((b) => b.setButtonText(p.token ? "Sign out" : "Sign in").onClick(async () => {
+        if (p.token) { p.token = p.s.login = ""; await p.save(); } else await p.signIn();
         this.display();
       }));
     const text = (name: string, key: "clientId" | "owner" | "repo" | "branch", desc = "") =>
