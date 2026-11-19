@@ -114,9 +114,29 @@ export default class GitHubConnect extends Plugin {
 
   contentsUrl(f: TFile) {
     if (!this.token) throw new Error("not signed in");
-    if (!this.s.repo) throw new Error("set the repository in settings");
+    if (!this.s.repo) throw new Error("choose a vault in settings");
     const p = f.path.split("/").map(encodeURIComponent).join("/");
     return `/repos/${OWNER}/${this.s.repo}/contents/${p}`;
+  }
+
+  async json(path: string) {
+    const r = await this.gh(path);
+    if (r.status >= 400) throw new Error(r.json?.message ?? `HTTP ${r.status}`);
+    return r.json;
+  }
+
+  // Vaults = OWNER repos the app is installed on AND this user can access (GitHub does the intersection).
+  async vaults(): Promise<string[]> {
+    const { installations } = await this.json("/user/installations?per_page=100");
+    const inst = installations.find((i: any) => i.account.login.toLowerCase() === OWNER.toLowerCase());
+    if (!inst) return [];
+    const names: string[] = [];
+    for (let page = 1; ; page++) {
+      const r = await this.json(`/user/installations/${inst.id}/repositories?per_page=100&page=${page}`);
+      names.push(...r.repositories.map((x: any) => x.name));
+      if (!r.repositories.length || names.length >= r.total_count) break;
+    }
+    return names.sort((a, b) => a.localeCompare(b));
   }
 
   async remote(f: TFile) {
@@ -163,10 +183,19 @@ class Tab extends PluginSettingTab {
       .setDesc(`The app only reaches ${OWNER} repos it is installed on. Org owners pick them here.`)
       .addButton((b) => b.setButtonText("Manage").onClick(() =>
         window.open(`https://github.com/organizations/${OWNER}/settings/installations`)));
-    const text = (name: string, key: "repo" | "branch", desc = "") =>
-      new Setting(el).setName(name).setDesc(desc).addText((t) =>
-        t.setValue(p.s[key]).onChange(async (v) => { p.s[key] = v.trim(); await p.save(); }));
-    text("Repository", "repo", `Vault repo in ${OWNER}, e.g. my-vault.`);
-    text("Branch", "branch");
+    if (p.token) new Setting(el).setName("Vault").setDesc(`${OWNER} repos you can open with this app.`)
+      .addDropdown((d) => {
+        d.addOption("", "Loading…");
+        d.onChange(async (v) => { p.s.repo = v; await p.save(); });
+        p.vaults().then((names) => {
+          d.selectEl.empty();
+          d.addOption("", names.length ? "Choose a vault" : "None: ask an org owner to add the app to a repo");
+          names.forEach((n) => d.addOption(n, n));
+          d.setValue(names.includes(p.s.repo) ? p.s.repo : "");
+        }, (e) => { d.selectEl.empty(); d.addOption("", `Could not load vaults: ${e.message}`); });
+      })
+      .addExtraButton((b) => b.setIcon("refresh-cw").setTooltip("Reload").onClick(() => this.display()));
+    new Setting(el).setName("Branch").addText((t) =>
+      t.setValue(p.s.branch).onChange(async (v) => { p.s.branch = v.trim(); await p.save(); }));
   }
 }

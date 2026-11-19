@@ -51,3 +51,18 @@ function setup(refreshWorks = true) {
   assert.deepEqual([p.token, p.refresh, p.s.login], ["", "", ""]);
 }
 console.log("ok: refresh, single-flight, sign-out on failed refresh");
+
+{ // vaults: picks the OWNER installation, pages through repositories, sorts
+  const { p } = setup();
+  p.token = "new";
+  const pages = { 1: ["zeta", "alpha"], 2: ["mid"] };
+  globalThis.github = async ({ url }) => {
+    if (url.includes("/user/installations?")) return { status: 200, json: { installations: [
+      { id: 9, account: { login: "someone-else" } }, { id: 7, account: { login: "isometriainternal" } }] } };
+    const m = url.match(/installations\/(\d+)\/repositories.*page=(\d+)/);
+    assert.equal(m[1], "7");
+    return { status: 200, json: { total_count: 3, repositories: (pages[m[2]] ?? []).map((name) => ({ name })) } };
+  };
+  assert.deepEqual(await p.vaults(), ["alpha", "mid", "zeta"]);
+}
+console.log("ok: vaults");

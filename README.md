@@ -6,7 +6,7 @@ Sign in to GitHub without a password or personal token (OAuth device flow via a 
 Built for the **IsometriaInternal** organization. The GitHub App `Obsidian-GitHub-Connect` (client ID `Iv23liN72h2n3K7zuhDS`, public by design) is owned by the org and can only be installed there.
 
 1. An org owner installs the app on the vault repos: Org → Settings → GitHub Apps → Obsidian-GitHub-Connect → Configure → **Only select repositories**.
-2. In Obsidian: Settings → GitHub Connect → **Sign in** (paste the copied code on github.com and approve), then set the repository name.
+2. In Obsidian: Settings → GitHub Connect → **Sign in** (enter the code on github.com and approve), then pick a **Vault** from the list: every IsometriaInternal repo the app is installed on that you can access.
 
 Access is the intersection of repos the app is installed on and repos the user can reach. Remove a user from the repo, team or org to cut them off.
 
