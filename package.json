@@ -1,10 +1,11 @@
 {
   "name": "obsidian-github",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "scripts": {
     "dev": "esbuild main.ts --bundle --external:obsidian --format=cjs --target=es2018 --outfile=main.js --watch",
     "test": "node test.mjs",
+    "starter": "node starter/build.mjs",
     "build": "tsc --noEmit && esbuild main.ts --bundle --external:obsidian --format=cjs --target=es2018 --minify --outfile=main.js"
   },
   "devDependencies": {

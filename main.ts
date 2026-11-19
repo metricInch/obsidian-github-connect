@@ -82,6 +82,8 @@ export default class GitHubConnect extends Plugin {
     this.registerView(VIEW, (leaf) => new VaultsView(leaf, this));
     this.addRibbonIcon("github", "GitHub vaults", () => this.openView());
     this.statusEl = this.addStatusBarItem(); // desktop only; mobile has no status bar
+    // First run (nothing pulled yet): open the panel so nobody has to find the icon.
+    this.app.workspace.onLayoutReady(() => { if (!Object.keys(this.s.synced).length) this.openView(); });
     this.addCommand({ id: "sign-in", name: "Sign in", callback: () => this.signIn().catch((e) => new Notice(`GitHub: ${e.message}`)) });
     this.addCommand({ id: "vaults", name: "Open vaults", callback: () => this.openView() });
     this.addCommand({ id: "sync-current", name: "Sync the vault of the current note", checkCallback: (checking) => {

@@ -1,5 +1,14 @@
 # GitHub Connect for Obsidian
 
+## For the team: ready vault (no setup)
+
+Download **[Isometria-Vault.zip](https://github.com/metricInch/obsidian-github-connect/releases/latest/download/Isometria-Vault.zip)**. It has everything already: this plugin, BRAT (keeps it up to date), Homepage and the Minimal theme.
+
+**Computer:** unzip it anywhere outside iCloud/Dropbox → Obsidian → **Open folder as vault** → choose *Isometria Vault* → **Trust author and enable plugins**. The welcome note and the GitHub vaults panel open by themselves: Sign in, then Pull.
+
+**iPhone / iPad:** in the Files app, unzip it and move the *Isometria Vault* folder into **On My iPhone → Obsidian** (not iCloud) → open Obsidian and pick it → **Trust author and enable plugins** → same as above.
+
+
 Sign in to GitHub without a password or personal token (OAuth device flow via a GitHub App), then push and pull notes to a repository.
 
 ## Setup
@@ -23,6 +32,8 @@ Real git in the plugin ([isomorphic-git](https://isomorphic-git.org)), no git in
 With [BRAT](https://github.com/TfTHacker/obsidian42-brat): Add beta plugin → `metricInch/obsidian-github-connect`.
 
 ## Build
+`npm run starter` builds `dist/Isometria-Vault.zip` (pinned upstream plugin versions; attach it to every release so the download link above keeps working).
+
 `npm i && npm run build`, then copy `main.js` and `manifest.json` to `<vault>/.obsidian/plugins/github-connect/`.
 
 ## Security
