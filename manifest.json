@@ -1,0 +1,9 @@
+{
+  "id": "github-connect",
+  "name": "GitHub Connect",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Sign in to GitHub without a password or personal token, then push and pull notes to a repository.",
+  "author": "metricInch",
+  "isDesktopOnly": false
+}
