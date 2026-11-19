@@ -219,7 +219,31 @@ try {
   assert.equal(sh(`git -C ${ad} show main:b.md`), "b2", "GitHub's change not reverted");
   assert.equal(sh(`git -C ${ad} rev-list --count main`), "3");
 
-  console.log("ok: shallow pull, sync both ways, deletes, conflict + resolve, link existing folder");
+  // interrupted Pull, case 1: only an empty .git on "master" was written (the iPhone report)
+  const F = device("frank");
+  fs.mkdirSync(path.join(F.root, "vault1"));
+  sh(`git init -q -b master ${path.join(F.root, "vault1")}`);
+  assert.equal(await F.sync(), "linked");
+  assert.equal(F.read("n1.md"), "ONE\ntwo\nalice and bob\n");
+  assert.equal(await F.sync(), "up to date");
+
+  // case 2: clone got refs and half the files, app was killed before it finished (synced never set)
+  const G = device("gina");
+  await G.sync();
+  fs.unlinkSync(G.file("n2.md"));                       // never written
+  fs.writeFileSync(G.file("n1.md"), "older copy\n");    // our own stale copy
+  fs.writeFileSync(G.file("mine.md"), "made by gina\n"); // a note she added meanwhile
+  delete G.p.s.synced.vault1;
+  const before = sh(`git -C ${bare} rev-parse main`);
+  assert.equal(await G.sync(), "linked");
+  assert.equal(G.read("n2.md"), "bob\n", "missing file restored, not deleted on GitHub");
+  assert.equal(G.read("n1.md"), "ONE\ntwo\nalice and bob\n", "stale copy replaced");
+  assert.equal(G.read("mine.md"), "made by gina\n", "her note kept");
+  assert.equal(sh(`git -C ${bare} rev-parse main`), before, "nothing pushed while linking");
+  assert.equal(await G.sync(), "1 change sent");
+  assert.equal(sh(`git -C ${bare} show main:n2.md`), "bob");
+
+  console.log("ok: shallow pull, sync both ways, deletes, conflict + resolve, link existing folder, unfinished pull");
 
   // empty repo (no commits yet): Pull works, first Sync creates the first commit
   sh(`git init -q --bare -b main ${path.join(srv, "IsometriaInternal", "empty.git")} && git -C ${path.join(srv, "IsometriaInternal", "empty.git")} config http.receivepack true`);

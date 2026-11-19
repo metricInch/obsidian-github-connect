@@ -209,9 +209,18 @@ export default class GitHubConnect extends Plugin {
       const onProgress = (p: { phase: string; loaded: number; total?: number }) =>
         say(p.phase, p.total ? p.loaded / p.total : undefined);
 
+      // A .git that never finished a Pull on this device (app closed mid-download, out of memory) holds
+      // nothing of the user's: drop it and link the folder again. Notes in the folder are not touched.
+      let unfinished = false;
+      if (!this.s.synced[repo] && (await a.exists(`${repo}/.git`))) {
+        say("Cleaning up an unfinished pull");
+        await a.rmdir(`${repo}/.git`, true);
+        unfinished = true;
+      }
+
       if (!(await a.exists(`${repo}/.git`))) {
         if (await a.exists(repo)) {
-          try { return this.done(repo, await this.adopt(repo, onProgress)); }
+          try { return this.done(repo, await this.adopt(repo, onProgress, unfinished)); }
           catch (e) { await a.rmdir(`${repo}/.git`, true).catch(() => {}); throw e; } // undo only what we added
         }
         say("Downloading");
@@ -279,9 +288,12 @@ export default class GitHubConnect extends Plugin {
   // Turn an existing folder (e.g. pulled by 0.4.0 without git) into a git repo in place. Never overwrites
   // a local edit: 0.4.0's per-file record (s.base, "<repo>/<path>" -> blob sha) tells untouched files
   // from edited ones. Untouched or missing files get GitHub's version; edited and new ones wait for Sync.
-  async adopt(repo: string, onProgress: (p: any) => void) {
+  // fromUnfinishedPull: the folder's copies of repo files came from our own interrupted clone, not from
+  // the user, so (without a 0.4.0 record) GitHub's version wins for them; notes not in the repo are kept.
+  async adopt(repo: string, onProgress: (p: any) => void, fromUnfinishedPull = false) {
     const g = this.g, fs = g.fs, dir = repo, a = this.app.vault.adapter;
     const base: Record<string, string> = (this.s as any).base ?? {};
+    const trustRemote = fromUnfinishedPull && !Object.keys(base).some((k) => k.startsWith(`${repo}/`));
     await git.init({ fs, dir, defaultBranch: "main" });
     await git.addRemote({ fs, dir, remote: "origin", url: `${this.base}/${OWNER}/${repo}.git` });
     onProgress({ phase: "Downloading", loaded: 0 });
@@ -303,6 +315,7 @@ export default class GitHubConnect extends Plugin {
       const remote = (await git.readBlob({ fs, dir, oid: f.fetchHead, filepath: file })).oid;
       if (oid === remote) take.push(file); // same content: just record it in the index
       else if (base[local] && oid === base[local]) take.push(file); // untouched here, changed on GitHub
+      else if (trustRemote) take.push(file); // left over from our interrupted clone
       else kept++; // edited here (or unknown): keep, Sync will commit it
     }
     if (take.length) await git.checkout({ fs, dir, ref: branch, filepaths: take, force: true, onProgress });
