@@ -174,7 +174,10 @@ export default class GitHubConnect extends Plugin {
         say(`${p.phase}${p.total ? ` ${Math.round((p.loaded / p.total) * 100)}%` : ""}`);
 
       if (!(await a.exists(`${repo}/.git`))) {
-        if (await a.exists(repo)) throw new Error(`a folder "${repo}" already exists here; rename or remove it, then Pull`);
+        if (await a.exists(repo)) {
+          try { return this.done(repo, await this.adopt(repo, onProgress)); }
+          catch (e) { await a.rmdir(`${repo}/.git`, true).catch(() => {}); throw e; } // undo only what we added
+        }
         try {
           await git.clone({ ...g, dir, url: `${this.base}/${OWNER}/${repo}.git`, depth: 1, singleBranch: true, noTags: true, onProgress });
         } catch (e) {
@@ -234,6 +237,38 @@ export default class GitHubConnect extends Plugin {
     } finally {
       this.busy.delete(repo);
     }
+  }
+
+  // Turn an existing folder (e.g. pulled by 0.4.0 without git) into a git repo in place. Never overwrites
+  // a local edit: 0.4.0's per-file record (s.base, "<repo>/<path>" -> blob sha) tells untouched files
+  // from edited ones. Untouched or missing files get GitHub's version; edited and new ones wait for Sync.
+  async adopt(repo: string, onProgress: (p: any) => void) {
+    const g = this.g, fs = g.fs, dir = repo, a = this.app.vault.adapter;
+    const base: Record<string, string> = (this.s as any).base ?? {};
+    await git.init({ fs, dir, defaultBranch: "main" });
+    await git.addRemote({ fs, dir, remote: "origin", url: `${this.base}/${OWNER}/${repo}.git` });
+    const f = await git.fetch({ ...g, dir, depth: 1, singleBranch: true, tags: false, onProgress });
+    if (!f.fetchHead) return "linked (GitHub repo is empty)";
+    const branch = (f.defaultBranch ?? "refs/heads/main").replace("refs/heads/", "");
+    await git.writeRef({ fs, dir, ref: `refs/heads/${branch}`, value: f.fetchHead, force: true });
+    await git.writeRef({ fs, dir, ref: `refs/remotes/origin/${branch}`, value: f.fetchHead, force: true });
+    await git.writeRef({ fs, dir, ref: "HEAD", value: `refs/heads/${branch}`, symbolic: true, force: true });
+    await git.setConfig({ fs, dir, path: `branch.${branch}.remote`, value: "origin" });
+    await git.setConfig({ fs, dir, path: `branch.${branch}.merge`, value: `refs/heads/${branch}` });
+
+    const take: string[] = [];
+    let kept = 0;
+    for (const file of await git.listFiles({ fs, dir, ref: f.fetchHead })) {
+      const local = `${repo}/${file}`;
+      if (!(await a.exists(local))) { take.push(file); continue; }
+      const { oid } = await git.hashBlob({ object: new Uint8Array(await a.readBinary(local)) });
+      const remote = (await git.readBlob({ fs, dir, oid: f.fetchHead, filepath: file })).oid;
+      if (oid === remote) take.push(file); // same content: just record it in the index
+      else if (base[local] && oid === base[local]) take.push(file); // untouched here, changed on GitHub
+      else kept++; // edited here (or unknown): keep, Sync will commit it
+    }
+    if (take.length) await git.checkout({ fs, dir, ref: branch, filepaths: take, force: true });
+    return kept ? `linked; ${kept} note${kept > 1 ? "s" : ""} edited here will be sent on Sync` : "linked";
   }
 
   async done(repo: string, msg: string) {
@@ -349,13 +384,14 @@ class VaultsModal extends Modal {
     loading.remove();
     if (!names.length) el.createEl("p", { text: "No vaults yet. Ask an org owner to add the app to a repo." });
     for (const name of names) {
-      const here = await p.app.vault.adapter.exists(`${name}/.git`);
+      const here = await p.app.vault.adapter.exists(`${name}/.git`), folder = here || (await p.app.vault.adapter.exists(name));
       const row = new Setting(el).setName(name);
       const m = p.s.merging[name];
       row.setDesc(m ? `Conflicts to fix: ${m.files.join(", ")}`
-        : here ? `In folder ${name}/ · synced ${p.s.synced[name] ? ago(p.s.synced[name]) : "never"}` : "Not on this device");
+        : here ? `In folder ${name}/ · synced ${p.s.synced[name] ? ago(p.s.synced[name]) : "never"}`
+        : folder ? `Folder ${name}/ is here but not linked to git yet. Your notes are kept.` : "Not on this device");
       row.addButton((b) => {
-        b.setButtonText(here ? "Sync" : "Pull").onClick(async () => {
+        b.setButtonText(here ? "Sync" : folder ? "Link" : "Pull").onClick(async () => {
           b.setDisabled(true);
           try {
             const msg = await p.sync(name, (t) => row.setDesc(t));

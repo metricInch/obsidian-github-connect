@@ -177,12 +177,32 @@ try {
   assert.equal(A.read("n1.md"), "ONE\ntwo\nalice and bob\n");
   assert.equal(sh(`git -C ${bare} cat-file -p main`).split("\n").filter((l) => l.startsWith("parent")).length, 2, "merge commit has two parents");
 
-  // a plain folder with the repo's name is never overwritten
-  const C = device("carol");
-  fs.mkdirSync(path.join(C.root, "vault1")); fs.writeFileSync(C.file("mine.md"), "keep");
-  await assert.rejects(C.sync(), /already exists/);
-  assert.equal(C.read("mine.md"), "keep");
-  console.log("ok: shallow pull, sync both ways, deletes, conflict + resolve, folder guard");
+  // a folder that already exists without git (0.4.0 pull) is linked in place, keeping local edits
+  const ad = path.join(srv, "IsometriaInternal", "adopt.git");
+  sh(`git init -q --bare -b main ${ad} && git -C ${ad} config http.receivepack true`);
+  sh(`rm -rf s2 && git init -q -b main s2 && cd s2 && git config user.email s@x && git config user.name seed && ` +
+     `echo a > a.md && echo b > b.md && echo same > same.md && echo '*.tmp' > .gitignore && git add -A && git commit -qm c1 && git push -q ${ad} main`);
+  const E = device("erin"), hash = (t) => sh(`git hash-object --stdin <<'X'\n${t}X`);
+  fs.mkdirSync(path.join(E.root, "adopt"));
+  const ef = (f) => path.join(E.root, "adopt", f);
+  fs.writeFileSync(ef("a.md"), "a edited\n");   // edited after the 0.4.0 pull
+  fs.writeFileSync(ef("b.md"), "b\n");          // untouched
+  fs.writeFileSync(ef("same.md"), "same\n");    // untouched, unchanged on GitHub
+  fs.writeFileSync(ef("new.md"), "new\n");      // created after the pull
+  E.p.s.base = { "adopt/a.md": hash("a\n"), "adopt/b.md": hash("b\n"), "adopt/same.md": hash("same\n") };
+  sh(`cd s2 && echo b2 > b.md && git commit -qam c2 && git push -q ${ad} main`); // someone changes b.md on GitHub
+  assert.match(await E.p.sync("adopt", () => {}), /linked; 1 note edited here/);
+  assert.equal(fs.readFileSync(ef("a.md"), "utf8"), "a edited\n", "local edit kept");
+  assert.equal(fs.readFileSync(ef("b.md"), "utf8"), "b2\n", "untouched note updated");
+  assert.equal(fs.readFileSync(ef(".gitignore"), "utf8"), "*.tmp\n", "skipped dot file restored");
+  assert.equal(fs.readFileSync(ef("new.md"), "utf8"), "new\n");
+  assert.equal(await E.p.sync("adopt", () => {}), "2 changes sent");
+  assert.equal(sh(`git -C ${ad} show main:a.md`), "a edited");
+  assert.equal(sh(`git -C ${ad} show main:new.md`), "new");
+  assert.equal(sh(`git -C ${ad} show main:b.md`), "b2", "GitHub's change not reverted");
+  assert.equal(sh(`git -C ${ad} rev-list --count main`), "3");
+
+  console.log("ok: shallow pull, sync both ways, deletes, conflict + resolve, link existing folder");
 
   // empty repo (no commits yet): Pull works, first Sync creates the first commit
   sh(`git init -q --bare -b main ${path.join(srv, "IsometriaInternal", "empty.git")} && git -C ${path.join(srv, "IsometriaInternal", "empty.git")} config http.receivepack true`);
