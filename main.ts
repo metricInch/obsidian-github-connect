@@ -74,8 +74,9 @@ export default class GitHubConnect extends Plugin {
     const d = (await requestUrl({ url: "https://github.com/login/device/code", method: "POST", throw: false,
       headers: FORM, body: `client_id=${CLIENT_ID}` })).json;
     if (!d.device_code) return new Notice(`GitHub: ${d.error_description ?? d.error ?? "check the client ID and that Device Flow is enabled"}`);
-    await navigator.clipboard.writeText(d.user_code);
-    const n = new Notice(`Code ${d.user_code} copied. Paste it on the GitHub page.`, 0);
+    // iOS may refuse clipboard writes after an await; the notice still shows the code.
+    const copied = await navigator.clipboard.writeText(d.user_code).then(() => true, () => false);
+    const n = new Notice(`Code ${d.user_code}${copied ? " (copied)" : ""}. Enter it on the GitHub page.`, 0);
     window.open(d.verification_uri);
 
     let wait: number = d.interval;
