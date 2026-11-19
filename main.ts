@@ -1,11 +1,12 @@
 import {
   App, Notice, Plugin, PluginSettingTab, Setting, TFile,
-  arrayBufferToBase64, base64ToArrayBuffer, requestUrl,
+  RequestUrlResponse, arrayBufferToBase64, base64ToArrayBuffer, requestUrl,
 } from "obsidian";
 
-interface Settings { clientId: string; login: string; owner: string; repo: string; branch: string }
-const DEFAULTS: Settings = { clientId: "", login: "", owner: "", repo: "", branch: "main" };
+interface Settings { clientId: string; login: string; expires: number; owner: string; repo: string; branch: string }
+const DEFAULTS: Settings = { clientId: "", login: "", expires: 0, owner: "", repo: "", branch: "main" };
 const SECRET = "github-connect-token";
+const REFRESH = "github-connect-refresh";
 const FORM = { Accept: "application/json", "Content-Type": "application/x-www-form-urlencoded" };
 
 export default class GitHubConnect extends Plugin {
@@ -14,6 +15,36 @@ export default class GitHubConnect extends Plugin {
   // Token lives in Obsidian's secret storage, not in the vault's data.json.
   get token() { return this.app.secretStorage.getSecret(SECRET) ?? ""; }
   set token(v: string) { this.app.secretStorage.setSecret(SECRET, v); }
+  get refresh() { return this.app.secretStorage.getSecret(REFRESH) ?? ""; }
+  set refresh(v: string) { this.app.secretStorage.setSecret(REFRESH, v); }
+  renewing?: Promise<boolean>;
+
+  // Expiring tokens: 8h access token + refresh token. Without expiry GitHub sends no expires_in.
+  keep(t: { access_token: string; refresh_token?: string; expires_in?: number }) {
+    this.token = t.access_token;
+    this.refresh = t.refresh_token ?? "";
+    this.s.expires = t.expires_in ? Date.now() + t.expires_in * 1000 : 0;
+  }
+
+  async signOut() {
+    this.token = this.refresh = this.s.login = "";
+    this.s.expires = 0;
+    await this.save();
+  }
+
+  // Device-flow tokens refresh without a client secret (GitHub docs). One refresh at a time:
+  // refresh tokens rotate, so a second parallel refresh with the old one would fail.
+  renew() {
+    return (this.renewing ??= (async () => {
+      if (!this.refresh) return false;
+      const t = (await requestUrl({ url: "https://github.com/login/oauth/access_token", method: "POST", throw: false, headers: FORM,
+        body: `client_id=${this.s.clientId}&grant_type=refresh_token&refresh_token=${encodeURIComponent(this.refresh)}` })).json;
+      if (!t.access_token) return false;
+      this.keep(t);
+      await this.save();
+      return true;
+    })().finally(() => (this.renewing = undefined)));
+  }
 
   async onload() {
     const d = (await this.loadData()) ?? {};
@@ -52,7 +83,7 @@ export default class GitHubConnect extends Plugin {
       const t = (await requestUrl({ url: "https://github.com/login/oauth/access_token", method: "POST", throw: false, headers: FORM,
         body: `client_id=${this.s.clientId}&device_code=${d.device_code}&grant_type=urn:ietf:params:oauth:grant-type:device_code` })).json;
       if (t.access_token) {
-        this.token = t.access_token;
+        this.keep(t);
         this.s.login = (await this.gh("/user")).json.login;
         await this.save();
         n.hide();
@@ -65,11 +96,16 @@ export default class GitHubConnect extends Plugin {
     new Notice("GitHub login timed out");
   }
 
-  async gh(path: string, method = "GET", body?: object) {
+  async gh(path: string, method = "GET", body?: object, retry = true): Promise<RequestUrlResponse> {
+    if (this.s.expires && Date.now() > this.s.expires - 60_000) await this.renew();
     const r = await requestUrl({ url: `https://api.github.com${path}`, method, throw: false,
       body: body && JSON.stringify(body),
       headers: { Authorization: `Bearer ${this.token}`, Accept: "application/vnd.github+json" } });
-    if (r.status === 401) { this.token = ""; await this.save(); throw new Error("session expired, run Sign in again"); }
+    if (r.status === 401) {
+      if (retry && (await this.renew())) return this.gh(path, method, body, false);
+      await this.signOut();
+      throw new Error("session expired, run Sign in again");
+    }
     return r;
   }
 
@@ -117,7 +153,7 @@ class Tab extends PluginSettingTab {
     new Setting(el).setName("Account")
       .setDesc(p.token ? `Signed in as ${p.s.login}` : "Not signed in")
       .addButton((b) => b.setButtonText(p.token ? "Sign out" : "Sign in").onClick(async () => {
-        if (p.token) { p.token = p.s.login = ""; await p.save(); } else await p.signIn();
+        if (p.token) await p.signOut(); else await p.signIn();
         this.display();
       }));
     const text = (name: string, key: "clientId" | "owner" | "repo" | "branch", desc = "") =>

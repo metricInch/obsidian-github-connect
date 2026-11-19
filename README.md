@@ -3,7 +3,7 @@
 Sign in to GitHub without a password or personal token (OAuth device flow via a GitHub App), then push and pull notes to a repository.
 
 ## Setup
-1. Create a GitHub App: Settings → Developer settings → GitHub Apps → New. Enable **Device Flow**, turn off the webhook, give Repository permissions → **Contents: Read & write**, and uncheck "Expire user authorization tokens". Copy the Client ID.
+1. Create a GitHub App: Settings → Developer settings → GitHub Apps → New. Enable **Device Flow**, turn off the webhook, give Repository permissions → **Contents: Read & write**, and keep "Expire user authorization tokens" checked: the plugin refreshes the 8-hour token itself (device-flow tokens refresh without a client secret). Copy the Client ID.
 2. Install the app on the repo you sync to.
 3. In Obsidian: Settings → GitHub Connect → paste the Client ID, set owner/repo/branch, click **Sign in**.
 
