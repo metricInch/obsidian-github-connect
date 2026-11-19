@@ -163,21 +163,23 @@ export default class GitHubConnect extends Plugin {
 
   // Pull (first time: shallow clone) or sync: commit local changes, fetch, merge, push.
   // Returns a one-line summary; throws with a readable message.
-  async sync(repo: string, say: (s: string) => void): Promise<string> {
+  async sync(repo: string, say: (step: string, done?: number) => void): Promise<string> {
     if (!this.token) throw new Error("sign in first");
     if (this.busy.has(repo)) throw new Error("already syncing");
     this.busy.add(repo);
     try {
       await this.fresh();
       const g = this.g, fs = g.fs, dir = repo, a = this.app.vault.adapter;
+      // done = 0..1 when git knows the total, undefined while waiting (e.g. the download itself).
       const onProgress = (p: { phase: string; loaded: number; total?: number }) =>
-        say(`${p.phase}${p.total ? ` ${Math.round((p.loaded / p.total) * 100)}%` : ""}`);
+        say(p.phase, p.total ? p.loaded / p.total : undefined);
 
       if (!(await a.exists(`${repo}/.git`))) {
         if (await a.exists(repo)) {
           try { return this.done(repo, await this.adopt(repo, onProgress)); }
           catch (e) { await a.rmdir(`${repo}/.git`, true).catch(() => {}); throw e; } // undo only what we added
         }
+        say("Downloading");
         try {
           await git.clone({ ...g, dir, url: `${this.base}/${OWNER}/${repo}.git`, depth: 1, singleBranch: true, noTags: true, onProgress });
         } catch (e) {
@@ -209,7 +211,7 @@ export default class GitHubConnect extends Plugin {
         await git.commit({ fs, dir, author, message: `Obsidian: ${changed} file${changed > 1 ? "s" : ""} by ${author.name}` });
       }
 
-      say("Fetching");
+      say("Downloading new commits");
       // No depth here: in a shallow repo this brings only the commits since our last sync.
       await git.fetch({ ...g, dir, singleBranch: true, ref: branch, tags: false, onProgress });
       const theirs = await git.resolveRef({ fs, dir, ref: `refs/remotes/origin/${branch}` }).catch(() => null);
@@ -227,7 +229,7 @@ export default class GitHubConnect extends Plugin {
       }
       if ((await git.resolveRef({ fs, dir, ref: "HEAD" })) !== before) {
         say("Updating notes");
-        await git.checkout({ fs, dir, ref: branch });
+        await git.checkout({ fs, dir, ref: branch, onProgress });
       }
 
       say("Sending");
@@ -247,6 +249,7 @@ export default class GitHubConnect extends Plugin {
     const base: Record<string, string> = (this.s as any).base ?? {};
     await git.init({ fs, dir, defaultBranch: "main" });
     await git.addRemote({ fs, dir, remote: "origin", url: `${this.base}/${OWNER}/${repo}.git` });
+    onProgress({ phase: "Downloading", loaded: 0 });
     const f = await git.fetch({ ...g, dir, depth: 1, singleBranch: true, tags: false, onProgress });
     if (!f.fetchHead) return "linked (GitHub repo is empty)";
     const branch = (f.defaultBranch ?? "refs/heads/main").replace("refs/heads/", "");
@@ -267,7 +270,7 @@ export default class GitHubConnect extends Plugin {
       else if (base[local] && oid === base[local]) take.push(file); // untouched here, changed on GitHub
       else kept++; // edited here (or unknown): keep, Sync will commit it
     }
-    if (take.length) await git.checkout({ fs, dir, ref: branch, filepaths: take, force: true });
+    if (take.length) await git.checkout({ fs, dir, ref: branch, filepaths: take, force: true, onProgress });
     return kept ? `linked; ${kept} note${kept > 1 ? "s" : ""} edited here will be sent on Sync` : "linked";
   }
 
@@ -393,13 +396,27 @@ class VaultsModal extends Modal {
       row.addButton((b) => {
         b.setButtonText(here ? "Sync" : folder ? "Link" : "Pull").onClick(async () => {
           b.setDisabled(true);
+          // Native <progress>: a value shows the percentage, no value shows a moving (indeterminate) bar.
+          row.descEl.empty();
+          const label = row.descEl.createDiv(), bar = row.descEl.createEl("progress", { attr: { max: "1" } });
+          bar.style.width = "100%";
+          const t0 = Date.now();
+          let step = "Starting", frac: number | undefined;
+          const show = () => {
+            label.setText(frac === undefined ? `${step} · ${Math.round((Date.now() - t0) / 1000)} s` : `${step} ${Math.round(frac * 100)}%`);
+            if (frac === undefined) bar.removeAttribute("value"); else bar.value = frac;
+          };
+          const tick = window.setInterval(show, 1000);
+          show();
           try {
-            const msg = await p.sync(name, (t) => row.setDesc(t));
+            const msg = await p.sync(name, (t, f) => { step = t; frac = f; show(); });
             new Notice(`${name}: ${msg}`);
             this.render();
           } catch (e: any) {
             row.setDesc(`Failed: ${e.message}`);
             b.setDisabled(false);
+          } finally {
+            window.clearInterval(tick);
           }
         });
         if (!here) b.setCta();

@@ -144,7 +144,11 @@ const A = device("alice"), B = device("bob"), log = () => sh(`git -C ${bare} log
 
 try {
   // first Pull: shallow clone into vault1/
-  assert.equal(await A.sync(), "pulled");
+  const steps = [];
+  assert.equal(await A.p.sync("vault1", (t, f) => steps.push([t, f])), "pulled");
+  assert.equal(steps[0][0], "Downloading", "bar starts before the download");
+  assert.ok(steps.some(([, f]) => f > 0 && f <= 1), "some step reports a percentage");
+  assert.ok(steps.every(([, f]) => f === undefined || (f >= 0 && f <= 1)));
   assert.equal(A.read("n2.md"), "b3\n");
   assert.equal(A.read("sub/deep.md"), "c\n");
   assert.ok(fs.existsSync(path.join(A.root, "vault1/.git/shallow")), "clone is shallow");
