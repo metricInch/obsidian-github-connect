@@ -1,7 +1,7 @@
 import { Buffer } from "buffer";
 import git, { GitHttpRequest, GitHttpResponse } from "isomorphic-git";
 import {
-  App, DataAdapter, ItemView, Notice, Plugin, PluginSettingTab, Setting, Stat, TFile, WorkspaceLeaf,
+  App, Component, DataAdapter, ItemView, MarkdownRenderer, Modal, Notice, Plugin, PluginSettingTab, Setting, Stat, TFile, WorkspaceLeaf,
   RequestUrlResponse, normalizePath, requestUrl,
 } from "obsidian";
 
@@ -94,6 +94,12 @@ export default class GitHubConnect extends Plugin {
       if (!checking) this.run(repo);
       return true;
     } });
+    this.addCommand({ id: "resolve", name: "Resolve sync conflicts", checkCallback: (checking) => {
+      const repo = this.app.workspace.getActiveFile()?.path.split("/")[0];
+      if (!repo || !this.s.merging[repo]) return false;
+      if (!checking) this.resolve(repo);
+      return true;
+    } });
     // Everyone's local vault name differs, so leave it out: the link opens in whichever vault is focused.
     // Every "Copy Obsidian URL" in Obsidian (Copy path → as Obsidian URL, the command, tab menus) goes
     // through app.getObsidianUrl(file). Undocumented, so if it is missing we add our own menu item instead.
@@ -137,9 +143,15 @@ export default class GitHubConnect extends Plugin {
     this.changed(true);
     this.sync(repo, (step, frac) => { this.jobs.set(repo, { ...this.jobs.get(repo)!, step, frac }); this.changed(false); })
       .then((m) => { new Notice(`${repo}: ${m}`); },
-        (e) => { this.errors[repo] = e.message; new Notice(`${repo}: ${e.message}`, 15000); })
+        (e) => {
+          this.errors[repo] = e.message;
+          new Notice(`${repo}: ${e.message}`, 15000);
+          if (this.s.merging[repo]) this.resolve(repo);
+        })
       .finally(() => { this.jobs.delete(repo); this.changed(true); });
   }
+
+  resolve(repo: string) { new ConflictModal(this, repo, [...(this.s.merging[repo]?.files ?? [])]).open(); }
 
   changed(structural: boolean) {
     const [repo, j] = [...this.jobs][0] ?? [];
@@ -305,7 +317,13 @@ export default class GitHubConnect extends Plugin {
           message: `Merge from GitHub into ${author.name}'s Obsidian` });
       } catch (e: any) {
         if (e?.code !== "MergeConflictError") throw e;
-        const files = e.data.bothModified.length ? e.data.bothModified : e.data.filepaths;
+        const files: string[] = e.data.bothModified.length ? e.data.bothModified : e.data.filepaths;
+        // isomorphic-git labels the halves "main" and a 40-char commit id; say whose each half is.
+        const who = (await git.readCommit({ fs, dir, oid: theirs })).commit.author.name;
+        for (const f of files) {
+          const x = `${repo}/${f}`;
+          if (await a.exists(x)) await a.write(x, relabel(await a.read(x), who));
+        }
         this.s.merging[repo] = { theirs, files };
         await this.save();
         throw new Error(`edited here and on GitHub: ${files.join(", ")}. Fix the <<<<<<< / >>>>>>> parts in those notes, then Sync`);
@@ -370,6 +388,21 @@ export default class GitHubConnect extends Plugin {
 
 export const vaultlessUrl = (path: string) => `obsidian://open?file=${encodeURIComponent(path)}`;
 export const dropVault = (url: string) => url.replace(/([?&])vault=[^&]*(&|$)/, "$1").replace(/[?&]$/, "");
+
+// Conflict blocks as isomorphic-git writes them: <<<<<<< label / ours / ======= / theirs / >>>>>>> label.
+const HUNK = /^<<<<<<<[^\n]*\n([\s\S]*?)^=======\n([\s\S]*?)^>>>>>>>([^\n]*)(?:\n|$)/gm;
+export const relabel = (text: string, who: string) =>
+  text.replace(/^<<<<<<< .*$/gm, "<<<<<<< Yours").replace(/^>>>>>>> .*$/gm, `>>>>>>> GitHub (last sync by ${who})`);
+export function hunks(text: string) {
+  const out: { ours: string; theirs: string; label: string }[] = [];
+  for (let m; (m = HUNK.exec(text)); ) out.push({ ours: m[1], theirs: m[2], label: m[3].trim() });
+  return out;
+}
+export type Pick = "ours" | "theirs" | "both";
+export const pick = (text: string, picks: Pick[]) => {
+  let i = 0;
+  return text.replace(HUNK, (_, o: string, t: string) => { const k = picks[i++]; return k === "ours" ? o : k === "theirs" ? t : o + t; });
+};
 
 // git add -A; returns how many files changed since the last commit.
 async function stageAll(fs: ReturnType<typeof vaultFs>, dir: string) {
@@ -523,6 +556,7 @@ class VaultsView extends ItemView {
           : here ? `In folder ${name}/ · synced ${p.s.synced[name] ? ago(p.s.synced[name]) : "never"}`
           : folder ? `Folder ${name}/ is here but not linked to git yet. Your notes are kept.` : "Not on this device");
       }
+      if (m && !job) row.addButton((b) => b.setButtonText("Resolve").setCta().onClick(() => p.resolve(name)));
       row.addButton((b) => {
         b.setButtonText(job ? "Working…" : here ? "Sync" : folder ? "Link" : "Pull").setDisabled(!!job).onClick(() => p.run(name));
         if (!here && !folder && !job) b.setCta();
@@ -554,5 +588,66 @@ class Tab extends PluginSettingTab {
       .setDesc(`The app only reaches ${OWNER} repos it is installed on. Org owners pick them here.`)
       .addButton((b) => b.setButtonText("Manage").onClick(() =>
         window.open(`https://github.com/organizations/${OWNER}/settings/installations`)));
+  }
+}
+
+// Conflicts as cards: for each block, your version and GitHub's side by side, rendered as notes.
+// Tap one (or Keep both), Save; after the last note the Sync runs again and makes the merge commit.
+class ConflictModal extends Modal {
+  md = new Component();
+  constructor(private p: GitHubConnect, private repo: string, private files: string[]) { super(p.app); }
+  onOpen() { this.md.load(); this.next(); }
+  onClose() { this.md.unload(); this.contentEl.empty(); }
+
+  async next() {
+    const a = this.app.vault.adapter;
+    let path = "", text = "";
+    for (let f; (f = this.files.shift()); ) {
+      path = `${this.repo}/${f}`;
+      if ((await a.exists(path)) && hunks((text = await a.read(path))).length) break;
+      path = "";
+    }
+    if (!path) { this.close(); this.p.run(this.repo); return; }
+    const hs = hunks(text), picks: (Pick | undefined)[] = hs.map(() => undefined), el = this.contentEl;
+    el.empty();
+    this.setTitle(`Edited here and on GitHub: ${path.slice(this.repo.length + 1)}`);
+    let save: HTMLButtonElement;
+    hs.forEach((h, i) => {
+      if (hs.length > 1) el.createDiv({ text: `Change ${i + 1} of ${hs.length}`, cls: "setting-item-name" });
+      const row = el.createDiv();
+      row.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;margin:6px 0";
+      const theirs = h.label.startsWith("GitHub") ? h.label : "GitHub";
+      const cards = ([["ours", "Yours", h.ours, "--color-green"], ["theirs", theirs, h.theirs, "--color-blue"]] as const).map(([k, label, body, color]) => {
+        const c = row.createDiv();
+        c.style.cssText = `flex:1 1 240px;min-width:0;cursor:pointer;padding:4px 12px;border-radius:8px;border:2px solid var(--background-modifier-border);border-left:6px solid var(${color})`;
+        c.createDiv({ text: label, cls: "setting-item-description" });
+        MarkdownRenderer.render(this.app, body.trim() ? body : "*(nothing)*", c.createDiv(), path, this.md);
+        c.onclick = () => choose(k);
+        return [k, c] as const;
+      });
+      const both = el.createEl("button", { text: "Keep both" });
+      both.style.marginBottom = "16px";
+      both.onclick = () => choose("both");
+      const choose = (k: Pick) => {
+        picks[i] = k;
+        for (const [ck, c] of cards) {
+          const on = k === "both" || k === ck;
+          c.style.borderColor = on ? "var(--interactive-accent)" : "var(--background-modifier-border)";
+          c.style.opacity = on ? "1" : "0.45";
+          c.style.borderLeftColor = `var(${ck === "ours" ? "--color-green" : "--color-blue"})`;
+        }
+        save.disabled = picks.includes(undefined);
+      };
+    });
+    new Setting(el)
+      .addButton((b) => b.setButtonText("Edit by hand").onClick(() => { this.close(); this.app.workspace.openLinkText(path, "", false); }))
+      .addButton((b) => {
+        save = b.buttonEl;
+        b.setButtonText(this.files.length ? "Save, next note" : "Save and sync").setCta().setDisabled(true).onClick(async () => {
+          const out = pick(text, picks as Pick[]), file = this.app.vault.getFileByPath(path);
+          if (file) await this.app.vault.modify(file, out); else await a.write(path, out);
+          this.next();
+        });
+      });
   }
 }

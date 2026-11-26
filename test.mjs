@@ -12,6 +12,7 @@ const stub = `
 export class Plugin { constructor(app) { this.app = app } async loadData() { return {} } async saveData() {} }
 export class PluginSettingTab {} export class Setting {} export class ItemView {}
 export class Notice { hide() {} }
+export class Modal {} export class Component {} export const MarkdownRenderer = {};
 export const normalizePath = (x) => x.split("/").filter(Boolean).join("/") || "/";
 // Local git server goes over real HTTP; everything else to the fake GitHub API.
 export async function requestUrl(o) {
@@ -24,7 +25,7 @@ const out = await build({ entryPoints: ["main.ts"], bundle: true, write: false, 
     b.onResolve({ filter: /^obsidian$/ }, () => ({ path: "obsidian", namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({ contents: stub, loader: "js" }));
   } }] });
-const { default: GitHubConnect, vaultlessUrl, dropVault } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
+const { default: GitHubConnect, vaultlessUrl, dropVault, hunks, pick } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
 
 function setup(refreshWorks = true) {
   const secrets = new Map();
@@ -77,6 +78,16 @@ console.log("ok: refresh, single-flight, sign-out on failed refresh");
   assert.deepEqual(await p.vaults(), ["alpha", "mid", "zeta"]);
 }
 console.log("ok: vaults");
+
+{ // conflict picker: keep yours / GitHub's / both per block; an empty side and a block at the very end
+  const t = "a\n<<<<<<< Yours\nx\n=======\ny\n>>>>>>> GitHub (last sync by z)\nb\n<<<<<<< Yours\n=======\ngone\n>>>>>>> GitHub (last sync by z)";
+  assert.deepEqual(hunks(t).map((h) => [h.ours, h.theirs]), [["x\n", "y\n"], ["", "gone\n"]]);
+  assert.equal(pick(t, ["ours", "theirs"]), "a\nx\nb\ngone\n");
+  assert.equal(pick(t, ["both", "ours"]), "a\nx\ny\nb\n");
+  assert.equal(pick(t, ["theirs", "both"]), "a\ny\nb\ngone\n");
+  assert.equal(hunks("no conflict\n").length, 0);
+}
+console.log("ok: conflict picker");
 
 
 // ---- git sync, end to end: two devices against a local `git http-backend` ----
@@ -187,7 +198,8 @@ try {
   A.write("n1.md", "ONE\ntwo\nalice\n"); await A.sync();
   B.write("n1.md", "ONE\ntwo\nbob\n");
   await assert.rejects(B.sync(), /edited here and on GitHub: n1.md/);
-  assert.match(B.read("n1.md"), /<<<<<<<[\s\S]*bob[\s\S]*alice[\s\S]*>>>>>>>/);
+  assert.equal(B.read("n1.md"), "ONE\ntwo\n<<<<<<< Yours\nbob\n=======\nalice\n>>>>>>> GitHub (last sync by alice)\n");
+  assert.deepEqual(hunks(B.read("n1.md")), [{ ours: "bob\n", theirs: "alice\n", label: "GitHub (last sync by alice)" }]);
   await assert.rejects(B.sync(), /still has conflict markers: n1.md/);
   B.write("n1.md", "ONE\ntwo\nalice and bob\n");
   assert.equal(await B.sync(), "1 change sent");
