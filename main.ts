@@ -1,7 +1,7 @@
 import { Buffer } from "buffer";
 import git, { GitHttpRequest, GitHttpResponse } from "isomorphic-git";
 import {
-  App, DataAdapter, ItemView, Notice, Plugin, PluginSettingTab, Setting, Stat, WorkspaceLeaf,
+  App, DataAdapter, ItemView, Notice, Plugin, PluginSettingTab, Setting, Stat, TFile, WorkspaceLeaf,
   RequestUrlResponse, normalizePath, requestUrl,
 } from "obsidian";
 
@@ -95,26 +95,21 @@ export default class GitHubConnect extends Plugin {
       return true;
     } });
     // Everyone's local vault name differs, so leave it out: the link opens in whichever vault is focused.
-    // Obsidian's own "Copy Obsidian URL" is re-pointed to copy the vault-less link. If it can't be found
-    // (label changed, other language), our own item is added instead.
-    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
-      if (!this.s.vaultlessLinks) return;
-      const copy = () => this.copyLink(file.path);
-      if (repointCopyUrl(menu, copy)) return;
-      menu.addItem((i) => i.setTitle("Copy Obsidian URL (no vault)").setIcon("link").onClick(copy));
-      window.setTimeout(() => repointCopyUrl(menu, copy)); // in case Obsidian adds its item after plugins
-    }));
-    this.addCommand({ id: "copy-vaultless-url", name: "Copy Obsidian URL (no vault)", checkCallback: (checking) => {
-      const f = this.app.workspace.getActiveFile();
-      if (!f || !this.s.vaultlessLinks) return false;
-      if (!checking) this.copyLink(f.path);
-      return true;
-    } });
-  }
-
-  copyLink(path: string) {
-    navigator.clipboard.writeText(vaultlessUrl(path))
-      .then(() => new Notice("Copied link without the vault name"), () => new Notice("Could not copy the link"));
+    // Every "Copy Obsidian URL" in Obsidian (Copy path → as Obsidian URL, the command, tab menus) goes
+    // through app.getObsidianUrl(file). Undocumented, so if it is missing we add our own menu item instead.
+    const app = this.app as any, own = app.getObsidianUrl, plugin = this;
+    if (typeof own === "function") {
+      app.getObsidianUrl = function (file: TFile) {
+        const url = own.call(this, file);
+        return plugin.s.vaultlessLinks ? dropVault(url) : url;
+      };
+      this.register(() => { app.getObsidianUrl = own; });
+    } else {
+      this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+        if (this.s.vaultlessLinks) menu.addItem((i) => i.setTitle("Copy Obsidian URL (no vault)").setIcon("link")
+          .onClick(() => navigator.clipboard.writeText(vaultlessUrl(file.path)).then(() => new Notice("Copied"))));
+      }));
+    }
   }
 
   save() { return this.saveData(this.s); }
@@ -374,16 +369,7 @@ export default class GitHubConnect extends Plugin {
 }
 
 export const vaultlessUrl = (path: string) => `obsidian://open?file=${encodeURIComponent(path)}`;
-
-// Undocumented: Menu.items / MenuItem.titleEl / MenuItem.submenu. Matched by the English label, so a
-// renamed or translated item is left alone (and keeps copying Obsidian's own link).
-export function repointCopyUrl(menu: any, onClick: () => void): boolean {
-  for (const item of menu?.items ?? []) {
-    if (item.titleEl?.textContent?.trim() === "Copy Obsidian URL") { item.onClick(onClick); return true; }
-    if (repointCopyUrl(item.submenu, onClick)) return true;
-  }
-  return false;
-}
+export const dropVault = (url: string) => url.replace(/([?&])vault=[^&]*(&|$)/, "$1").replace(/[?&]$/, "");
 
 // git add -A; returns how many files changed since the last commit.
 async function stageAll(fs: ReturnType<typeof vaultFs>, dir: string) {
