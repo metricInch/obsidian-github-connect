@@ -32,7 +32,9 @@ Real git in the plugin ([isomorphic-git](https://isomorphic-git.org)), no git in
 With [BRAT](https://github.com/TfTHacker/obsidian42-brat): Add beta plugin → `metricInch/obsidian-github-connect`.
 
 ## Build
-`npm run starter` builds `dist/Isometria-Vault.zip` (pinned upstream plugin versions; attach it to every release so the download link above keeps working).
+`npm run starter` builds `dist/Isometria-Vault.zip` (pinned upstream plugin versions).
+
+**Release:** bump `version` in `manifest.json` and `package.json` and merge to `main`. The `release` workflow builds, tests and publishes that version with `main.js`, `manifest.json` and `Isometria-Vault.zip`; a version that already has a release is skipped.
 
 `npm i && npm run build`, then copy `main.js` and `manifest.json` to `<vault>/.obsidian/plugins/github-connect/`.
 

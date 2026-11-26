@@ -1,0 +1,33 @@
+# Release when manifest.json on main has a version that has no release yet.
+name: release
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          v=$(jq -r .version manifest.json)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          gh release view "$v" >/dev/null 2>&1 && echo "exists=1" >> "$GITHUB_OUTPUT" || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - if: steps.v.outputs.exists != '1'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - if: steps.v.outputs.exists != '1'
+        run: |
+          npm ci
+          npm run build
+          npm test
+          npm run starter
+          gh release create "${{ steps.v.outputs.version }}" main.js manifest.json dist/Isometria-Vault.zip \
+            --target "$GITHUB_SHA" --title "${{ steps.v.outputs.version }}" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
