@@ -125,6 +125,7 @@ function adapter(root) {
     },
     readBinary: async (x) => { const b = await fsp.readFile(P(x)); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); },
     read: async (x) => fsp.readFile(P(x), "utf8"),
+    write: async (x, d) => fsp.writeFile(P(x), d),
     writeBinary: async (x, d) => fsp.writeFile(P(x), Buffer.from(d)),
     mkdir: async (x) => fsp.mkdir(P(x)),
     rmdir: async (x, rec) => (rec ? fsp.rm(P(x), { recursive: true }) : fsp.rmdir(P(x))),
@@ -270,6 +271,15 @@ try {
   assert.equal(sh(`git -C ${late} show main:mine.md`), "hana");
   assert.equal(sh(`git -C ${late} show main:notes/a.md`), "brain");
   console.log("ok: empty repo filled later");
+
+  // CLAUDE.md at the vault root: created once, never overwritten
+  const C = device("cleo"), cm = path.join(C.root, "CLAUDE.md");
+  await C.p.claudeMd();
+  assert.equal(fs.readFileSync(cm, "utf8"), "@VaultGlobals/AGENTS.md\n");
+  fs.writeFileSync(cm, "mine\n");
+  await C.p.claudeMd();
+  assert.equal(fs.readFileSync(cm, "utf8"), "mine\n", "existing CLAUDE.md kept");
+  console.log("ok: CLAUDE.md");
 } finally {
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
