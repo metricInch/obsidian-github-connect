@@ -1,7 +1,7 @@
 import { Buffer } from "buffer";
 import git, { GitHttpRequest, GitHttpResponse } from "isomorphic-git";
 import {
-  App, Component, DataAdapter, ItemView, MarkdownRenderer, Modal, Notice, Plugin, PluginSettingTab, Setting, Stat, TFile, WorkspaceLeaf,
+  App, DataAdapter, ItemView, Modal, Notice, Plugin, PluginSettingTab, Setting, Stat, TFile, WorkspaceLeaf,
   RequestUrlResponse, normalizePath, requestUrl,
 } from "obsidian";
 
@@ -393,11 +393,18 @@ export const dropVault = (url: string) => url.replace(/([?&])vault=[^&]*(&|$)/, 
 const HUNK = /^<<<<<<<[^\n]*\n([\s\S]*?)^=======\n([\s\S]*?)^>>>>>>>([^\n]*)(?:\n|$)/gm;
 export const relabel = (text: string, who: string) =>
   text.replace(/^<<<<<<< .*$/gm, "<<<<<<< Yours").replace(/^>>>>>>> .*$/gm, `>>>>>>> GitHub (last sync by ${who})`);
-export function hunks(text: string) {
-  const out: { ours: string; theirs: string; label: string }[] = [];
-  for (let m; (m = HUNK.exec(text)); ) out.push({ ours: m[1], theirs: m[2], label: m[3].trim() });
+type Hunk = { ours: string; theirs: string; label: string };
+// The note as unchanged text and conflicts, in order.
+export function parts(text: string) {
+  const out: (string | Hunk)[] = [];
+  let at = 0;
+  for (let m; (m = HUNK.exec(text)); at = HUNK.lastIndex) {
+    out.push(text.slice(at, m.index), { ours: m[1], theirs: m[2], label: m[3].trim() });
+  }
+  out.push(text.slice(at));
   return out;
 }
+export const hunks = (text: string) => parts(text).filter((x): x is Hunk => typeof x !== "string");
 export type Pick = "ours" | "theirs" | "both";
 export const pick = (text: string, picks: Pick[]) => {
   let i = 0;
@@ -591,13 +598,13 @@ class Tab extends PluginSettingTab {
   }
 }
 
-// Conflicts as cards: for each block, your version and GitHub's side by side, rendered as notes.
-// Tap one (or Keep both), Save; after the last note the Sync runs again and makes the merge commit.
+// Conflicts the way GitHub shows them: the whole note as text, each conflict inline with its two
+// versions tinted and Accept yours / Accept GitHub's / Accept both above it. Long unchanged stretches
+// fold. After the last note, Sync runs again and makes the merge commit.
 class ConflictModal extends Modal {
-  md = new Component();
   constructor(private p: GitHubConnect, private repo: string, private files: string[]) { super(p.app); }
-  onOpen() { this.md.load(); this.next(); }
-  onClose() { this.md.unload(); this.contentEl.empty(); }
+  onOpen() { this.modalEl.style.width = "min(900px, 95vw)"; this.next(); }
+  onClose() { this.contentEl.empty(); }
 
   async next() {
     const a = this.app.vault.adapter;
@@ -608,46 +615,80 @@ class ConflictModal extends Modal {
       path = "";
     }
     if (!path) { this.close(); this.p.run(this.repo); return; }
-    const hs = hunks(text), picks: (Pick | undefined)[] = hs.map(() => undefined), el = this.contentEl;
+    const segs = parts(text), hs = segs.filter((x): x is Hunk => typeof x !== "string");
+    const picks: (Pick | undefined)[] = hs.map(() => undefined), el = this.contentEl;
     el.empty();
-    this.setTitle(`Edited here and on GitHub: ${path.slice(this.repo.length + 1)}`);
+    this.setTitle(path.slice(this.repo.length + 1));
+    const status = el.createDiv({ cls: "setting-item-description" });
+    const box = el.createDiv();
+    box.style.cssText = "margin:8px 0;max-height:65vh;overflow:auto;border:1px solid var(--background-modifier-border);" +
+      "border-radius:6px;font-family:var(--font-monospace);font-size:var(--font-ui-small);line-height:1.6";
+    const tint = (c: string) => `rgba(var(--color-${c}-rgb),0.14)`;
+    const lines = (parent: HTMLElement, s: string, bg = "") => {
+      for (const l of s.replace(/\n$/, "").split("\n")) {
+        const d = parent.createDiv({ text: l || " " });
+        d.style.cssText = `white-space:pre-wrap;padding:0 12px;background:${bg}`;
+      }
+    };
+    const strip = (parent: HTMLElement, label: string, bg: string) => {
+      const d = parent.createDiv({ text: label });
+      d.style.cssText = `padding:2px 12px;font-family:var(--font-interface);font-size:var(--font-ui-smaller);color:var(--text-muted);background:${bg}`;
+    };
     let save: HTMLButtonElement;
-    hs.forEach((h, i) => {
-      if (hs.length > 1) el.createDiv({ text: `Change ${i + 1} of ${hs.length}`, cls: "setting-item-name" });
-      const row = el.createDiv();
-      row.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;margin:6px 0";
-      const theirs = h.label.startsWith("GitHub") ? h.label : "GitHub";
-      const cards = ([["ours", "Yours", h.ours, "--color-green"], ["theirs", theirs, h.theirs, "--color-blue"]] as const).map(([k, label, body, color]) => {
-        const c = row.createDiv();
-        c.style.cssText = `flex:1 1 240px;min-width:0;cursor:pointer;padding:4px 12px;border-radius:8px;border:2px solid var(--background-modifier-border);border-left:6px solid var(${color})`;
-        c.createDiv({ text: label, cls: "setting-item-description" });
-        MarkdownRenderer.render(this.app, body.trim() ? body : "*(nothing)*", c.createDiv(), path, this.md);
-        c.onclick = () => choose(k);
-        return [k, c] as const;
-      });
-      const both = el.createEl("button", { text: "Keep both" });
-      both.style.marginBottom = "16px";
-      both.onclick = () => choose("both");
-      const choose = (k: Pick) => {
-        picks[i] = k;
-        for (const [ck, c] of cards) {
-          const on = k === "both" || k === ck;
-          c.style.borderColor = on ? "var(--interactive-accent)" : "var(--background-modifier-border)";
-          c.style.opacity = on ? "1" : "0.45";
-          c.style.borderLeftColor = `var(${ck === "ours" ? "--color-green" : "--color-blue"})`;
+    const update = () => {
+      const n = picks.filter(Boolean).length;
+      status.setText(`${n} of ${hs.length} conflict${hs.length > 1 ? "s" : ""} resolved`);
+      save.disabled = n < hs.length;
+    };
+    let h = 0;
+    segs.forEach((seg, si) => {
+      if (typeof seg === "string") {
+        // unchanged text: show 3 lines next to each conflict, fold the rest
+        const ls = seg.replace(/\n$/, "").split("\n"), first = si === 0, last = si === segs.length - 1;
+        const head = first ? 0 : 3, tail = last ? 0 : 3;
+        if (!seg || ls.length <= head + tail + 1) { if (seg) lines(box, seg); return; }
+        if (head) lines(box, ls.slice(0, head).join("\n"));
+        const fold = box.createDiv({ text: `⋯ ${ls.length - head - tail} unchanged lines` });
+        fold.style.cssText = "padding:2px 12px;cursor:pointer;color:var(--text-faint);background:var(--background-secondary);font-family:var(--font-interface);font-size:var(--font-ui-smaller)";
+        const hidden = ls.slice(head, ls.length - tail).join("\n");
+        fold.onclick = () => { const d = createDiv(); lines(d, hidden); fold.replaceWith(...Array.from(d.childNodes)); };
+        if (tail) lines(box, ls.slice(-tail).join("\n"));
+        return;
+      }
+      const i = h++, block = box.createDiv();
+      block.style.cssText = "border-top:1px solid var(--background-modifier-border);border-bottom:1px solid var(--background-modifier-border)";
+      const draw = () => {
+        block.empty();
+        const bar = block.createDiv();
+        bar.style.cssText = "display:flex;gap:14px;flex-wrap:wrap;padding:3px 12px;background:var(--background-secondary);font-family:var(--font-interface);font-size:var(--font-ui-smaller)";
+        bar.createSpan({ text: `Conflict ${i + 1} of ${hs.length}` }).style.color = "var(--text-muted)";
+        const link = (text: string, f: () => void) => { const x = bar.createEl("a", { text, href: "#" }); x.onclick = (e) => { e.preventDefault(); f(); }; };
+        const set = (k?: Pick) => () => { picks[i] = k; draw(); update(); };
+        const theirs = seg.label.startsWith("GitHub") ? seg.label : "GitHub";
+        const k = picks[i];
+        if (!k) {
+          link("Accept yours", set("ours")); link("Accept GitHub's", set("theirs")); link("Accept both", set("both"));
+          strip(block, seg.ours ? "Yours" : "Yours: removed", tint("green")); if (seg.ours) lines(block, seg.ours, tint("green"));
+          strip(block, seg.theirs ? theirs : `${theirs}: removed`, tint("blue")); if (seg.theirs) lines(block, seg.theirs, tint("blue"));
+        } else {
+          bar.createSpan({ text: `✓ ${k === "ours" ? "Yours" : k === "theirs" ? "GitHub's" : "Both"} kept` });
+          link("Undo", set(undefined));
+          const kept = k === "ours" ? seg.ours : k === "theirs" ? seg.theirs : seg.ours + seg.theirs;
+          if (kept) lines(block, kept); else strip(block, "(removed)", "");
         }
-        save.disabled = picks.includes(undefined);
       };
+      draw();
     });
     new Setting(el)
       .addButton((b) => b.setButtonText("Edit by hand").onClick(() => { this.close(); this.app.workspace.openLinkText(path, "", false); }))
       .addButton((b) => {
         save = b.buttonEl;
-        b.setButtonText(this.files.length ? "Save, next note" : "Save and sync").setCta().setDisabled(true).onClick(async () => {
+        b.setButtonText(this.files.length ? "Save, next note" : "Save and sync").setCta().onClick(async () => {
           const out = pick(text, picks as Pick[]), file = this.app.vault.getFileByPath(path);
           if (file) await this.app.vault.modify(file, out); else await a.write(path, out);
           this.next();
         });
       });
+    update();
   }
 }

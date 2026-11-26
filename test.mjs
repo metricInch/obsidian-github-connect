@@ -25,7 +25,7 @@ const out = await build({ entryPoints: ["main.ts"], bundle: true, write: false, 
     b.onResolve({ filter: /^obsidian$/ }, () => ({ path: "obsidian", namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({ contents: stub, loader: "js" }));
   } }] });
-const { default: GitHubConnect, vaultlessUrl, dropVault, hunks, pick } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
+const { default: GitHubConnect, vaultlessUrl, dropVault, hunks, parts, pick } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
 
 function setup(refreshWorks = true) {
   const secrets = new Map();
@@ -86,6 +86,7 @@ console.log("ok: vaults");
   assert.equal(pick(t, ["both", "ours"]), "a\nx\ny\nb\n");
   assert.equal(pick(t, ["theirs", "both"]), "a\ny\nb\ngone\n");
   assert.equal(hunks("no conflict\n").length, 0);
+  assert.deepEqual(parts(t).map((x) => (typeof x === "string" ? x : "#")), ["a\n", "#", "b\n", "#", ""]);
 }
 console.log("ok: conflict picker");
 
