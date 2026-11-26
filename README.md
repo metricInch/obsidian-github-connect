@@ -26,7 +26,7 @@ Real git in the plugin ([isomorphic-git](https://isomorphic-git.org)), no git in
 
 - **Pull** (first time): shallow clone, only the latest commit, into a vault folder named after the repo. Each folder is its own git repo and syncs on its own.
 - **Sync**: commit everything changed in that folder (edits, new and deleted notes) as one commit, fetch only the new commits, merge, push.
-- **Conflicts**: if a note was edited here and on GitHub, Sync stops and leaves `<<<<<<<` / `>>>>>>>` markers in it. Fix the note, Sync again; that makes the merge commit. Sync refuses while markers remain.
+- **Conflicts**: if a note was edited here and on GitHub, Sync stops and opens the conflict view: the whole note, each conflict inline with *Yours* (green) and *GitHub* (blue), and **Accept yours / Accept GitHub's / Accept both** above it. **Save and sync** finishes the merge. Closed it? The vault's **Resolve** button or the *Resolve sync conflicts* command opens it again. The note itself carries `<<<<<<< Yours` / `>>>>>>> GitHub (last sync by …)` markers, so **Edit by hand** works too; Sync refuses while markers remain.
 - A folder that already exists without git (pulled by 0.4.0, or made by hand) shows **Link**: it becomes a git repo in place. Notes edited since the 0.4.0 pull and new notes are kept and sent on the next Sync; untouched notes get GitHub's latest version.
 - Empty repos work: Pull, add notes, Sync makes the first commit on `main`.
 
