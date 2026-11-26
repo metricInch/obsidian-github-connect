@@ -84,6 +84,7 @@ export default class GitHubConnect extends Plugin {
     this.statusEl = this.addStatusBarItem(); // desktop only; mobile has no status bar
     // First run (nothing pulled yet): open the panel so nobody has to find the icon.
     this.app.workspace.onLayoutReady(() => { if (!Object.keys(this.s.synced).length) this.openView(); });
+    this.app.workspace.onLayoutReady(() => this.claudeMd().catch(() => {}));
     this.addCommand({ id: "sign-in", name: "Sign in", callback: () => this.signIn().catch((e) => new Notice(`GitHub: ${e.message}`)) });
     this.addCommand({ id: "vaults", name: "Open vaults", callback: () => this.openView() });
     this.addCommand({ id: "sync-current", name: "Sync the vault of the current note", checkCallback: (checking) => {
@@ -95,6 +96,14 @@ export default class GitHubConnect extends Plugin {
   }
 
   save() { return this.saveData(this.s); }
+
+  // Agent rules at the vault root: AGENTS.md points at the shared rules, CLAUDE.md (read by Claude Code)
+  // points at AGENTS.md. Each is written only if missing, never overwritten.
+  async claudeMd() {
+    const a = this.app.vault.adapter;
+    for (const [f, text] of [["AGENTS.md", "@VaultGlobals/AGENTS.md\n"], ["CLAUDE.md", "@AGENTS.md\n"]])
+      if (!(await a.exists(f))) await a.write(f, text);
+  }
 
   async openView() {
     const ws = this.app.workspace;
