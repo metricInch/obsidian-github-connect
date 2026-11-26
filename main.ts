@@ -13,8 +13,9 @@ interface Settings {
   login: string; id: number; expires: number;
   synced: Record<string, number>;
   merging: Record<string, { theirs: string; files: string[] }>;
+  vaultlessLinks: boolean; // "Copy Obsidian URL (no vault)" in the file menu
 }
-const DEFAULTS: Settings = { login: "", id: 0, expires: 0, synced: {}, merging: {} };
+const DEFAULTS: Settings = { login: "", id: 0, expires: 0, synced: {}, merging: {}, vaultlessLinks: true };
 // GitHub App "Obsidian-GitHub-Connect", owned by and installable only on IsometriaInternal.
 const CLIENT_ID = "Iv23liN72h2n3K7zuhDS"; // public by design: device flow has no secret
 const OWNER = "IsometriaInternal";
@@ -93,6 +94,22 @@ export default class GitHubConnect extends Plugin {
       if (!checking) this.run(repo);
       return true;
     } });
+    // Everyone's local vault name differs, so leave it out: the link opens in whichever vault is focused.
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (this.s.vaultlessLinks) menu.addItem((i) => i.setTitle("Copy Obsidian URL (no vault)").setIcon("link")
+        .onClick(() => this.copyLink(file.path)));
+    }));
+    this.addCommand({ id: "copy-vaultless-url", name: "Copy Obsidian URL (no vault)", checkCallback: (checking) => {
+      const f = this.app.workspace.getActiveFile();
+      if (!f || !this.s.vaultlessLinks) return false;
+      if (!checking) this.copyLink(f.path);
+      return true;
+    } });
+  }
+
+  copyLink(path: string) {
+    navigator.clipboard.writeText(vaultlessUrl(path))
+      .then(() => new Notice("Copied link without the vault name"), () => new Notice("Could not copy the link"));
   }
 
   save() { return this.saveData(this.s); }
@@ -351,6 +368,8 @@ export default class GitHubConnect extends Plugin {
   }
 }
 
+export const vaultlessUrl = (path: string) => `obsidian://open?file=${encodeURIComponent(path)}`;
+
 // git add -A; returns how many files changed since the last commit.
 async function stageAll(fs: ReturnType<typeof vaultFs>, dir: string) {
   let n = 0;
@@ -508,6 +527,9 @@ class VaultsView extends ItemView {
         if (!here && !folder && !job) b.setCta();
       });
     }
+    new Setting(el).setName("Shareable links")
+      .setDesc("File menu: Copy Obsidian URL (no vault). Opens for everyone, whatever they named their vault.")
+      .addToggle((t) => t.setValue(p.s.vaultlessLinks).onChange(async (v) => { p.s.vaultlessLinks = v; await p.save(); }));
     this.tick();
   }
 }

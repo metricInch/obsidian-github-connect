@@ -17,6 +17,8 @@ Built for the **IsometriaInternal** organization. The GitHub App `Obsidian-GitHu
 1. An org owner installs the app on the vault repos: Org → Settings → GitHub Apps → Obsidian-GitHub-Connect → Configure → **Only select repositories**.
 2. In Obsidian: Settings → GitHub Connect → **Sign in** (enter the code on github.com and approve), then open **GitHub vaults** (ribbon icon or command). It opens in the right sidebar: every IsometriaInternal repo you can access, each with its own **Pull** / **Link** / **Sync** button. Jobs run in the background: close the panel or keep writing; a notice says when each finishes, and the status bar shows progress on desktop.
 
+**Shareable links:** right-click a note → **Copy Obsidian URL (no vault)** gives `obsidian://open?file=<path>`, which works for everyone whatever they named their vault (Obsidian's own copy includes the local vault name). Turn it off with the *Shareable links* toggle at the bottom of the GitHub vaults panel.
+
 Access is the intersection of repos the app is installed on and repos the user can reach. Remove a user from the repo, team or org to cut them off.
 
 ## How sync works

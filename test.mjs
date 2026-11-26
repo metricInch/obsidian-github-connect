@@ -24,7 +24,7 @@ const out = await build({ entryPoints: ["main.ts"], bundle: true, write: false, 
     b.onResolve({ filter: /^obsidian$/ }, () => ({ path: "obsidian", namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({ contents: stub, loader: "js" }));
   } }] });
-const { default: GitHubConnect } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
+const { default: GitHubConnect, vaultlessUrl } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
 
 function setup(refreshWorks = true) {
   const secrets = new Map();
@@ -282,6 +282,10 @@ try {
   assert.equal(fs.readFileSync(am, "utf8"), "mine\n", "existing AGENTS.md kept");
   assert.equal(fs.readFileSync(cm, "utf8"), "@AGENTS.md\n", "missing CLAUDE.md recreated");
   console.log("ok: AGENTS.md + CLAUDE.md");
+
+  // Shareable link: no vault= (names differ per person), path encoded
+  assert.equal(vaultlessUrl("Vault/competitors/hue & co.md"), "obsidian://open?file=Vault%2Fcompetitors%2Fhue%20%26%20co.md");
+  console.log("ok: vault-less link");
 } finally {
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
