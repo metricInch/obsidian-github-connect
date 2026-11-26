@@ -24,7 +24,7 @@ const out = await build({ entryPoints: ["main.ts"], bundle: true, write: false, 
     b.onResolve({ filter: /^obsidian$/ }, () => ({ path: "obsidian", namespace: "stub" }));
     b.onLoad({ filter: /.*/, namespace: "stub" }, () => ({ contents: stub, loader: "js" }));
   } }] });
-const { default: GitHubConnect, vaultlessUrl } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
+const { default: GitHubConnect, vaultlessUrl, repointCopyUrl } = await import("data:text/javascript;base64," + Buffer.from(out.outputFiles[0].text).toString("base64"));
 
 function setup(refreshWorks = true) {
   const secrets = new Map();
@@ -285,6 +285,12 @@ try {
 
   // Shareable link: no vault= (names differ per person), path encoded
   assert.equal(vaultlessUrl("Vault/competitors/hue & co.md"), "obsidian://open?file=Vault%2Fcompetitors%2Fhue%20%26%20co.md");
+  // Obsidian's own menu item is re-pointed, also inside a submenu; other items untouched
+  const item = (title, submenu) => ({ titleEl: { textContent: title }, submenu, cb: null, onClick(f) { this.cb = f; } });
+  const core = item("Copy Obsidian URL"), other = item("Copy path", { items: [core] }), mine = () => {};
+  assert.ok(repointCopyUrl({ items: [item("Rename"), other] }, mine));
+  assert.equal(core.cb, mine); assert.equal(other.cb, null);
+  assert.ok(!repointCopyUrl({ items: [item("Kopieren")] }, mine), "not found: caller adds its own item");
   console.log("ok: vault-less link");
 } finally {
   server.close();
