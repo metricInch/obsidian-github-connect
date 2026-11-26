@@ -97,10 +97,12 @@ export default class GitHubConnect extends Plugin {
 
   save() { return this.saveData(this.s); }
 
-  // Claude Code reads CLAUDE.md at the vault root; point it at the shared rules. Never overwrites.
+  // Agent rules at the vault root: AGENTS.md points at the shared rules, CLAUDE.md (read by Claude Code)
+  // points at AGENTS.md. Each is written only if missing, never overwritten.
   async claudeMd() {
     const a = this.app.vault.adapter;
-    if (!(await a.exists("CLAUDE.md"))) await a.write("CLAUDE.md", "@VaultGlobals/AGENTS.md\n");
+    for (const [f, text] of [["AGENTS.md", "@VaultGlobals/AGENTS.md\n"], ["CLAUDE.md", "@AGENTS.md\n"]])
+      if (!(await a.exists(f))) await a.write(f, text);
   }
 
   async openView() {

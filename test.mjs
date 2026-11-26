@@ -272,14 +272,16 @@ try {
   assert.equal(sh(`git -C ${late} show main:notes/a.md`), "brain");
   console.log("ok: empty repo filled later");
 
-  // CLAUDE.md at the vault root: created once, never overwritten
-  const C = device("cleo"), cm = path.join(C.root, "CLAUDE.md");
+  // AGENTS.md + CLAUDE.md at the vault root: created once, never overwritten
+  const C = device("cleo"), am = path.join(C.root, "AGENTS.md"), cm = path.join(C.root, "CLAUDE.md");
   await C.p.claudeMd();
-  assert.equal(fs.readFileSync(cm, "utf8"), "@VaultGlobals/AGENTS.md\n");
-  fs.writeFileSync(cm, "mine\n");
+  assert.equal(fs.readFileSync(am, "utf8"), "@VaultGlobals/AGENTS.md\n");
+  assert.equal(fs.readFileSync(cm, "utf8"), "@AGENTS.md\n");
+  fs.writeFileSync(am, "mine\n"); fs.rmSync(cm);
   await C.p.claudeMd();
-  assert.equal(fs.readFileSync(cm, "utf8"), "mine\n", "existing CLAUDE.md kept");
-  console.log("ok: CLAUDE.md");
+  assert.equal(fs.readFileSync(am, "utf8"), "mine\n", "existing AGENTS.md kept");
+  assert.equal(fs.readFileSync(cm, "utf8"), "@AGENTS.md\n", "missing CLAUDE.md recreated");
+  console.log("ok: AGENTS.md + CLAUDE.md");
 } finally {
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
